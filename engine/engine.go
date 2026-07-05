@@ -53,18 +53,18 @@ const (
 	// (16 KiB) for codesign(1).
 	maxPageSizeLog2 = 16
 
-	machHeaderSize32       = 28
-	machHeaderSize64       = 32
-	fatHeaderSize          = 8
-	fatArchSize32          = 20
-	fatArchSize64          = 32
-	loadCommandSize        = 8
-	linkeditDataCmdSize    = 16
-	superBlobHeaderSize    = 12
-	blobIndexSize          = 8
-	cdHeaderSize           = 44 // through pageSizeLog2; we never read past byte 40
-	maxNFatArch            = 128
-	maxSuperBlobCount      = 16
+	machHeaderSize32    = 28
+	machHeaderSize64    = 32
+	fatHeaderSize       = 8
+	fatArchSize32       = 20
+	fatArchSize64       = 32
+	loadCommandSize     = 8
+	linkeditDataCmdSize = 16
+	superBlobHeaderSize = 12
+	blobIndexSize       = 8
+	cdHeaderSize        = 44 // through pageSizeLog2; we never read past byte 40
+	maxNFatArch         = 128
+	maxSuperBlobCount   = 16
 )
 
 // Kind classifies the code signature a Mach-O file carries.
