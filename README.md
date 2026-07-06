@@ -1,5 +1,8 @@
 # machokeeper
 
+[![CI](https://github.com/machokeeper/machokeeper/actions/workflows/ci.yml/badge.svg)](https://github.com/machokeeper/machokeeper/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/machokeeper/machokeeper)](https://goreportcard.com/report/github.com/machokeeper/machokeeper)
+
 Keep your Nix store's Mach-O binaries valid.
 
 On macOS, a binary only runs if its code signature's page hashes match its contents — the kernel kills it at first page-in otherwise (`Killed: 9`, `cs_invalid_page`). Nix stores accumulate binaries that fail this check: store-path hash rewriting damages signatures during builds ([NixOS/nixpkgs#507531](https://github.com/NixOS/nixpkgs/issues/507531), [NixOS/nix#6065](https://github.com/NixOS/nix/issues/6065)), and producer bugs ship pre-broken artifacts through cache.nixos.org ([tracking scanner](https://github.com/ak2k/nix-507531-scope)). macOS 27 tightens enforcement: binaries that still run today become launch-fatal.
