@@ -17,12 +17,16 @@ const usage = `machokeeper — keep your Nix store's Mach-O binaries valid
 Usage:
   machokeeper doctor [--fix] PATH...   diagnose (and with --fix, repair) files or store paths
   machokeeper doctor --scan [--fix]    scan the whole local Nix store
+  machokeeper doctor --fix-live PATH   also repair GC-rooted paths (e.g. a login shell) in place
   machokeeper check PATH...            exit 2 if any signature is stale or unverifiable
   machokeeper help
 
-Without --fix, doctor only reports. Repair rewrites only stale hash
-slots (byte-exact undo journal written next to the report) and never
-touches Developer-ID-signed files or content-addressed paths.`
+Without --fix, doctor only reports. --fix repairs unrooted store paths
+by re-registering them (correct NAR hash); --fix-live additionally
+repairs rooted paths in place and reconciles their hash. Repair rewrites
+only stale hash slots (byte-exact undo journal written next to the
+report) and never touches Developer-ID-signed files or content-addressed
+paths.`
 
 func main() {
 	if len(os.Args) < 2 {

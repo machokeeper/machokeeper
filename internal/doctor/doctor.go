@@ -94,12 +94,16 @@ func walk(root string, visit func(*Finding)) error {
 // Run implements `machokeeper doctor`.
 func Run(args []string) int {
 	fix := false
+	fixLive := false
 	scan := false
 	var paths []string
 	for _, a := range args {
 		switch a {
 		case "--fix":
 			fix = true
+		case "--fix-live":
+			fix = true
+			fixLive = true
 		case "--scan":
 			scan = true
 		default:
@@ -182,12 +186,14 @@ func Run(args []string) int {
 		g := groups[key]
 
 		// A rooted or referenced store path cannot be deleted, so it
-		// cannot be re-registered via export/delete/import. Repairing
-		// its bytes in place would leave the database NAR hash stale
-		// (and `nix store verify --repair` would then regress it to the
-		// broken cached copy). Refuse here; that case is the job of the
-		// forthcoming `--fix-live`.
-		if g.storePath != "" {
+		// cannot be re-registered via export/delete/import. Without
+		// --fix-live, refuse: repairing its bytes in place while
+		// leaving the database NAR hash stale would let
+		// `nix store verify --repair` regress it to the broken cached
+		// copy. With --fix-live, repair in place and reconcile the hash
+		// row directly (below).
+		reregister := g.storePath != ""
+		if g.storePath != "" && !fixLive {
 			blockers, err := storePathBlockers(g.storePath)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "fix: %s: %v\n", g.storePath, err)
@@ -196,7 +202,7 @@ func Run(args []string) int {
 			if len(blockers) > 0 {
 				fmt.Printf("SKIP    %s: in use (%s%s); repairing it in place would leave its recorded hash stale.\n",
 					g.storePath, blockers[0], more(blockers))
-				fmt.Println("        Rebuild it, or wait for `--fix-live` for GC-rooted paths (e.g. a login shell).")
+				fmt.Println("        Re-run with --fix-live to repair a GC-rooted path (e.g. a login shell) and reconcile its hash.")
 				continue
 			}
 		}
@@ -218,12 +224,19 @@ func Run(args []string) int {
 			continue
 		}
 
-		// Re-register a store path so the database hash matches the
-		// repaired bytes. Non-store files are done after the on-disk
-		// write.
-		if g.storePath != "" {
-			if err := nixstore.Reregister(g.storePath); err != nil {
-				fmt.Fprintf(os.Stderr, "fix: %s: %v\n", g.storePath, err)
+		// Make the database hash match the repaired bytes. For an
+		// unrooted path, export/delete/import is cleanest. For a rooted
+		// one (--fix-live), reconcile the hash row in place without
+		// deleting the path.
+		if reregister {
+			var regErr error
+			if fixLive {
+				regErr = reconcileHash(g.storePath)
+			} else {
+				regErr = nixstore.Reregister(g.storePath)
+			}
+			if regErr != nil {
+				fmt.Fprintf(os.Stderr, "fix: %s: %v\n", g.storePath, regErr)
 				fmt.Fprintf(os.Stderr, "      (files were repaired on disk but the recorded hash is now stale; `nix store verify` will report it)\n")
 				continue
 			}
@@ -251,6 +264,22 @@ func more(blockers []string) string {
 		return fmt.Sprintf(" and %d more", len(blockers)-1)
 	}
 	return ""
+}
+
+// reconcileHash updates the database NAR hash of an already-repaired
+// store path in place (no delete), so it works on GC-rooted paths.
+// Dumps the repaired NAR, computes its hash, and re-registers validity
+// with the path's existing deriver and references.
+func reconcileHash(storePath string) error {
+	nar, err := nixstore.DumpNAR(storePath)
+	if err != nil {
+		return err
+	}
+	deriver, refs, err := nixstore.PathInfo(storePath)
+	if err != nil {
+		return err
+	}
+	return nixstore.RegisterValidity(storePath, deriver, nixstore.NarHash(nar), int64(len(nar)), refs)
 }
 
 // storePathBlockers returns GC roots and referrers that prevent deleting

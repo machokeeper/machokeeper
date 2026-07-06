@@ -72,6 +72,73 @@ func Referrers(storePath string) ([]string, error) {
 	return refs, nil
 }
 
+// DumpNAR streams the NAR serialisation of `path` to `w` (nix-store
+// --dump). Used to recompute a path's NAR hash after an in-place
+// repair, without deleting it.
+func DumpNAR(path string) ([]byte, error) {
+	out, err := exec.Command("nix-store", "--dump", path).Output()
+	if err != nil {
+		return nil, fmt.Errorf("dumping %s: %w", path, err)
+	}
+	return out, nil
+}
+
+// RegisterValidity re-registers `storePath` with a corrected NAR hash
+// and size, preserving its references and deriver, via
+// `nix-store --register-validity --reregister`. This updates the
+// database row in place — the path is not deleted — so it works on
+// GC-rooted paths that Reregister cannot touch. `references` and
+// `deriver` come from a prior query; `narHash` is the sha256 of the
+// repaired NAR in `sha256:<base32>` form.
+func RegisterValidity(storePath, deriver, narHash string, narSize int64, references []string) error {
+	// The registration format read on stdin is, per line group:
+	//   <store path>
+	//   <deriver or empty>
+	//   <narHash>
+	//   <narSize>            (with --hash-given)
+	//   <#references>
+	//   <reference>...       (one per line)
+	var b strings.Builder
+	fmt.Fprintln(&b, storePath)
+	fmt.Fprintln(&b, deriver)
+	fmt.Fprintln(&b, narHash)
+	fmt.Fprintln(&b, narSize)
+	fmt.Fprintln(&b, len(references))
+	for _, r := range references {
+		fmt.Fprintln(&b, r)
+	}
+	cmd := exec.Command("nix-store", "--register-validity", "--reregister", "--hash-given")
+	cmd.Stdin = strings.NewReader(b.String())
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("re-registering validity of %s: %w", storePath, err)
+	}
+	return nil
+}
+
+// PathInfo returns the deriver and references of `storePath`, needed to
+// re-register it with a new hash.
+func PathInfo(storePath string) (deriver string, references []string, err error) {
+	d, err := exec.Command("nix-store", "--query", "--deriver", storePath).Output()
+	if err != nil {
+		return "", nil, fmt.Errorf("querying deriver of %s: %w", storePath, err)
+	}
+	deriver = strings.TrimSpace(string(d))
+	if deriver == "unknown-deriver" {
+		deriver = ""
+	}
+	r, err := exec.Command("nix-store", "--query", "--references", storePath).Output()
+	if err != nil {
+		return "", nil, fmt.Errorf("querying references of %s: %w", storePath, err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(r)), "\n") {
+		if line != "" {
+			references = append(references, line)
+		}
+	}
+	return deriver, references, nil
+}
+
 // Reregister re-registers `storePath` from its current on-disk contents
 // via export → delete → import, so the database NAR hash matches the
 // repaired bytes. The path keeps its name (input-addressed paths do not
