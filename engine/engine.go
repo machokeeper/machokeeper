@@ -185,6 +185,35 @@ func findSignature(data []byte, sliceBase int) (uint32, uint32, bool) {
 	return 0, 0, false
 }
 
+// hasNonEmptyCMS scans a parsed SuperBlob's entries for a signature
+// slot carrying more than the empty 8-byte wrapper ad-hoc codesign(1)
+// leaves in place — anything larger is a PKCS#7 chain. This is the one
+// definition of "carries a CMS signature"; detection and the repair
+// refusal both use it.
+func hasNonEmptyCMS(data []byte, sbAbs int, sigSize uint32, sbCount uint32) bool {
+	for bi := 0; bi < int(sbCount); bi++ {
+		entryOff := sbAbs + superBlobHeaderSize + bi*blobIndexSize
+		if entryOff+blobIndexSize > sbAbs+int(sigSize) {
+			break
+		}
+		if rdBE32(data, entryOff) != csSlotSignature {
+			continue
+		}
+		blobRel := rdBE32(data, entryOff+4)
+		blobAbs := sbAbs + int(blobRel)
+		if int(blobRel) > int(sigSize) || blobAbs+8 > sbAbs+int(sigSize) {
+			continue
+		}
+		if rdBE32(data, blobAbs) != csMagicBlobWrapper {
+			continue
+		}
+		if rdBE32(data, blobAbs+4) > 8 {
+			return true
+		}
+	}
+	return false
+}
+
 // detectSlice classifies the signature (if any) of one slice.
 func detectSlice(data []byte, sliceBase int) Kind {
 	sigOff, sigSize, ok := findSignature(data, sliceBase)
@@ -206,37 +235,21 @@ func detectSlice(data []byte, sliceBase int) Kind {
 	if sbCount > maxSuperBlobCount {
 		return AdHoc
 	}
-	for bi := 0; bi < int(sbCount); bi++ {
-		entryOff := sbAbs + superBlobHeaderSize + bi*blobIndexSize
-		if entryOff+blobIndexSize > sbAbs+int(sigSize) {
-			break
-		}
-		if rdBE32(data, entryOff) != csSlotSignature {
-			continue
-		}
-		blobRel := rdBE32(data, entryOff+4)
-		blobAbs := sbAbs + int(blobRel)
-		if int(blobRel) > int(sigSize) || blobAbs+8 > sbAbs+int(sigSize) {
-			continue
-		}
-		if rdBE32(data, blobAbs) != csMagicBlobWrapper {
-			continue
-		}
-		// An empty 8-byte wrapper is what ad-hoc codesign(1)
-		// leaves in place; anything larger is a PKCS#7 chain.
-		if rdBE32(data, blobAbs+4) > 8 {
-			return CMS
-		}
+	if hasNonEmptyCMS(data, sbAbs, sigSize, sbCount) {
+		return CMS
 	}
 	return AdHoc
 }
 
-// Detect classifies contents as a Mach-O file carrying a code
-// signature. For fat containers the strongest kind across slices is
-// returned. Purely content-based — identical on every platform.
-func Detect(contents []byte) Kind {
+// walkContainer dispatches visit over every valid slice of a thin or
+// fat container: visit(sliceBase, sliceEnd) with absolute bounds. It is
+// the ONE traversal — Detect, Check and Repair all drive it, so a slice
+// one walks the others walk too (a slice one skipped could otherwise
+// pass a check it was never given). visit returning an error stops the
+// walk. Non-Mach-O contents visit nothing.
+func walkContainer(contents []byte, visit func(sliceBase, sliceEnd int) error) error {
 	if len(contents) < machHeaderSize32 {
-		return None
+		return nil
 	}
 	magicLE := rdLE32(contents, 0)
 	magicBE := rdBE32(contents, 0)
@@ -244,10 +257,10 @@ func Detect(contents []byte) Kind {
 	// Byte-swapped magics (MH_CIGAM etc.) are deliberately not
 	// handled: they only occur in PowerPC-era big-endian binaries.
 	if magicLE == machMagic32 || magicLE == machMagic64 {
-		return detectSlice(contents, 0)
+		return visit(0, len(contents))
 	}
 	if magicBE != fatMagic32 && magicBE != fatMagic64 {
-		return None
+		return nil
 	}
 	is64 := magicBE == fatMagic64
 	archSize := fatArchSize32
@@ -256,13 +269,12 @@ func Detect(contents []byte) Kind {
 	}
 	nfat := rdBE32(contents, 4)
 	if nfat == 0 || nfat > maxNFatArch {
-		return None
+		return nil
 	}
 	archArrayEnd := uint64(fatHeaderSize) + uint64(nfat)*uint64(archSize)
 	if archArrayEnd > uint64(len(contents)) {
-		return None
+		return nil
 	}
-	result := None
 	for i := 0; i < int(nfat); i++ {
 		archOff := fatHeaderSize + i*archSize
 		var sliceOff, sliceSize uint64
@@ -276,10 +288,24 @@ func Detect(contents []byte) Kind {
 		if !validSliceBounds(sliceOff, sliceSize, archArrayEnd, uint64(len(contents))) {
 			continue
 		}
-		if k := detectSlice(contents, int(sliceOff)); k > result {
-			result = k
+		if err := visit(int(sliceOff), int(sliceOff+sliceSize)); err != nil {
+			return err
 		}
 	}
+	return nil
+}
+
+// Detect classifies contents as a Mach-O file carrying a code
+// signature. For fat containers the strongest kind across slices is
+// returned. Purely content-based — identical on every platform.
+func Detect(contents []byte) Kind {
+	result := None
+	_ = walkContainer(contents, func(sliceBase, _ int) error {
+		if k := detectSlice(contents, sliceBase); k > result {
+			result = k
+		}
+		return nil
+	})
 	return result
 }
 
@@ -292,7 +318,11 @@ func Detect(contents []byte) Kind {
 //
 // When write=true, changed is appended with one Change per rewritten
 // slot (for undo journaling).
-func fixupSlice(data []byte, sliceBase int, path string, write bool, changed *[]Change) (bool, error) {
+//
+// sliceEnd is the absolute end of this slice (len(data) for a thin
+// file): page hashing never reads past it, so a forged codeLimit in one
+// fat slice cannot hash a neighbour slice's bytes.
+func fixupSlice(data []byte, sliceBase, sliceEnd int, path string, write bool, changed *[]Change) (bool, error) {
 	sigOff, sigSize, ok := findSignature(data, sliceBase)
 	if !ok {
 		return false, nil
@@ -317,27 +347,8 @@ func fixupSlice(data []byte, sliceBase int, path string, write bool, changed *[]
 	// Pre-scan for a non-empty CMS blob before repairing. In check
 	// mode a CMS slice is verified like any other — stale hashes
 	// under a CMS signature are still stale.
-	if write {
-		for bi := 0; bi < int(sbCount); bi++ {
-			entryOff := sbAbs + superBlobHeaderSize + bi*blobIndexSize
-			if entryOff+blobIndexSize > sbAbs+int(sigSize) {
-				break
-			}
-			if rdBE32(data, entryOff) != csSlotSignature {
-				continue
-			}
-			blobRel := rdBE32(data, entryOff+4)
-			blobAbs := sbAbs + int(blobRel)
-			if int(blobRel) > int(sigSize) || blobAbs+8 > sbAbs+int(sigSize) {
-				continue
-			}
-			if rdBE32(data, blobAbs) != csMagicBlobWrapper {
-				continue
-			}
-			if rdBE32(data, blobAbs+4) > 8 {
-				return false, &ErrCMSRepair{Path: path}
-			}
-		}
+	if write && hasNonEmptyCMS(data, sbAbs, sigSize, sbCount) {
+		return false, &ErrCMSRepair{Path: path}
 	}
 
 	modified := false
@@ -413,6 +424,12 @@ func fixupSlice(data []byte, sliceBase int, path string, write bool, changed *[]
 			unverifiable = true
 			continue
 		}
+		// codeLimit must stay inside this slice: hashing past sliceEnd
+		// would read a neighbour slice's bytes in a fat container.
+		if uint64(sliceBase)+uint64(codeLimit) > uint64(sliceEnd) {
+			unverifiable = true
+			continue
+		}
 		for i := 0; i < int(nCodeSlots); i++ {
 			pageStart := uint64(sliceBase) + uint64(i)*uint64(pageSize)
 			pageEnd := uint64(sliceBase) + uint64(i+1)*uint64(pageSize)
@@ -432,7 +449,7 @@ func fixupSlice(data []byte, sliceBase int, path string, write bool, changed *[]
 					if changed != nil {
 						old := make([]byte, hashSize)
 						copy(old, data[slot:slot+hashSize])
-						*changed = append(*changed, Change{Offset: int64(slot), Old: old})
+						*changed = append(*changed, Change{Offset: int64(slot), Old: old, New: sum})
 					}
 					copy(data[slot:slot+hashSize], sum)
 				}
@@ -461,59 +478,63 @@ func bytesEqual(a, b []byte) bool {
 	return true
 }
 
-// Change records one slot rewrite for byte-exact undo.
+// Change records one slot rewrite for byte-exact undo. Old is the slot
+// before repair, New the recomputed hash written over it; undo verifies
+// the file still holds New at Offset before restoring Old, so a journal
+// carrying New can never be applied to a file that changed since the
+// repair. (Journals written before New existed skip that verification;
+// undo warns when applying one.)
 type Change struct {
 	Offset int64
 	Old    []byte
+	New    []byte
+}
+
+// sliceCarriesCMS reports whether the slice's signature (if any)
+// carries a non-empty CMS blob. Bounds mirror fixupSlice's; anything
+// that doesn't parse is "no CMS" — fixupSlice will handle it.
+func sliceCarriesCMS(data []byte, sliceBase int) bool {
+	sigOff, sigSize, ok := findSignature(data, sliceBase)
+	if !ok {
+		return false
+	}
+	sbAbs := sliceBase + int(sigOff)
+	if sigSize < superBlobHeaderSize || sbAbs+int(sigSize) > len(data) || sbAbs+int(sigSize) < sbAbs {
+		return false
+	}
+	if rdBE32(data, sbAbs) != csMagicEmbeddedSignature {
+		return false
+	}
+	sbCount := rdBE32(data, sbAbs+8)
+	if sbCount > maxSuperBlobCount {
+		return false
+	}
+	return hasNonEmptyCMS(data, sbAbs, sigSize, sbCount)
 }
 
 // walk applies fixupSlice across the container (thin or fat).
+//
+// In write mode ALL slices are scanned for CMS before any is repaired:
+// Repair's contract is "ErrCMSRepair without touching a byte", and in a
+// fat container a repairable slice can precede the CMS one.
 func walk(contents []byte, path string, write bool, changed *[]Change) (bool, error) {
-	if len(contents) < machHeaderSize32 {
-		return false, nil
-	}
-	magicLE := rdLE32(contents, 0)
-	magicBE := rdBE32(contents, 0)
-	if magicLE == machMagic32 || magicLE == machMagic64 {
-		return fixupSlice(contents, 0, path, write, changed)
-	}
-	if magicBE != fatMagic32 && magicBE != fatMagic64 {
-		return false, nil
-	}
-	is64 := magicBE == fatMagic64
-	archSize := fatArchSize32
-	if is64 {
-		archSize = fatArchSize64
-	}
-	nfat := rdBE32(contents, 4)
-	if nfat == 0 || nfat > maxNFatArch {
-		return false, nil
-	}
-	archArrayEnd := uint64(fatHeaderSize) + uint64(nfat)*uint64(archSize)
-	if archArrayEnd > uint64(len(contents)) {
-		return false, nil
+	if write {
+		cms := false
+		_ = walkContainer(contents, func(sliceBase, _ int) error {
+			cms = cms || sliceCarriesCMS(contents, sliceBase)
+			return nil
+		})
+		if cms {
+			return false, &ErrCMSRepair{Path: path}
+		}
 	}
 	modified := false
-	for i := 0; i < int(nfat); i++ {
-		archOff := fatHeaderSize + i*archSize
-		var sliceOff, sliceSize uint64
-		if is64 {
-			sliceOff = rdBE64(contents, archOff+8)
-			sliceSize = rdBE64(contents, archOff+16)
-		} else {
-			sliceOff = uint64(rdBE32(contents, archOff+8))
-			sliceSize = uint64(rdBE32(contents, archOff+12))
-		}
-		if !validSliceBounds(sliceOff, sliceSize, archArrayEnd, uint64(len(contents))) {
-			continue
-		}
-		m, err := fixupSlice(contents, int(sliceOff), path, write, changed)
-		if err != nil {
-			return modified, err
-		}
+	err := walkContainer(contents, func(sliceBase, sliceEnd int) error {
+		m, err := fixupSlice(contents, sliceBase, sliceEnd, path, write, changed)
 		modified = modified || m
-	}
-	return modified, nil
+		return err
+	})
+	return modified, err
 }
 
 // Check reports whether any signature in contents is stale or cannot

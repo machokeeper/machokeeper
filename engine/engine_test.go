@@ -602,3 +602,145 @@ func TestFuzzMutationsNeverPanic(t *testing.T) {
 		}
 	}
 }
+
+func TestFatSliceCodeLimitCannotCrossSliceBoundary(t *testing.T) {
+	// Two slices in one fat container; slice 0's codeLimit is forged to
+	// reach past its own slice into slice 1's bytes. The engine must
+	// treat that CD as unverifiable — never hash across the boundary and
+	// "repair" the slice against a neighbour's bytes.
+	cds := []cdSpec{{csHashTypeSHA256, 32}}
+	s0 := makeRepairableSlice(cds, 2, 0)
+	s1 := makeRepairableSlice(cds, 2, 0)
+	fat := makeFat([][]byte{s0, s1}, false)
+
+	// Locate slice 0 inside the container and forge its codeLimit to
+	// run 100 bytes past the slice's end.
+	off0 := int(binary.BigEndian.Uint32(fat[8+8:]))
+	cdOff := off0 + 2*4096 + 12 + 8
+	putBE32(fat, cdOff+32, uint32(len(s0)+100))
+
+	before := append([]byte(nil), fat...)
+	_, _, err := Repair(fat, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Slice 0's forged CD must not have been "repaired" using slice 1's
+	// bytes: its hash slots must be untouched (still the stale zeros).
+	slot0 := fat[cdOff+44 : cdOff+44+32]
+	if !bytes.Equal(slot0, before[cdOff+44:cdOff+44+32]) {
+		t.Fatal("engine hashed across a fat slice boundary and rewrote the forged CD's slots")
+	}
+	// And check must fail closed on it.
+	fresh := append([]byte(nil), before...)
+	if !Check(fresh, "test") {
+		t.Fatal("cross-boundary codeLimit must be unverifiable")
+	}
+}
+
+// makeSpecialSlotSlice builds a signed slice with nSpecial special-slot
+// hashes before the code slots (hashOffset > cdHeaderSize), the shape
+// codesign(1) emits for real binaries (Info.plist, requirements, ...).
+// Code slots are zeroed (stale); special slots hold arbitrary bytes the
+// engine must preserve — they hash other blobs, not code pages.
+func makeSpecialSlotSlice(nSpecial, pages int) []byte {
+	const headerSize, lcSize, pageSize, hashSize = 32, 16, 4096, 32
+	sigOff := pages * pageSize
+	sbHeader := 12 + 1*8
+	hashOffset := 44 + nSpecial*hashSize
+	cdLen := hashOffset + pages*hashSize
+	sigSize := sbHeader + cdLen
+	s := bytes.Repeat([]byte{'A'}, sigOff+sigSize)
+
+	putLE32(s, 0, machMagic64)
+	putLE32(s, 16, 1)
+	putLE32(s, 20, lcSize)
+	putLE32(s, headerSize+0, lcCodeSignature)
+	putLE32(s, headerSize+4, lcSize)
+	putLE32(s, headerSize+8, uint32(sigOff))
+	putLE32(s, headerSize+12, uint32(sigSize))
+
+	putBE32(s, sigOff+0, csMagicEmbeddedSignature)
+	putBE32(s, sigOff+4, uint32(sigSize))
+	putBE32(s, sigOff+8, 1)
+	putBE32(s, sigOff+12, 0) // CSSLOT_CODEDIRECTORY
+	putBE32(s, sigOff+16, uint32(sbHeader))
+
+	cdOff := sigOff + sbHeader
+	putBE32(s, cdOff+0, csMagicCodeDirectory)
+	putBE32(s, cdOff+4, uint32(cdLen))
+	putBE32(s, cdOff+16, uint32(hashOffset))
+	putBE32(s, cdOff+24, uint32(nSpecial))
+	putBE32(s, cdOff+28, uint32(pages))
+	putBE32(s, cdOff+32, uint32(sigOff)) // codeLimit
+	s[cdOff+36] = 32
+	s[cdOff+37] = csHashTypeSHA256
+	s[cdOff+39] = 12
+	// Special slots: fill with a recognizable pattern to detect any
+	// write; code slots zeroed (stale).
+	for j := 0; j < nSpecial*hashSize; j++ {
+		s[cdOff+44+j] = 0xEE
+	}
+	for j := 0; j < pages*hashSize; j++ {
+		s[cdOff+hashOffset+j] = 0
+	}
+	return s
+}
+
+func TestSpecialSlotsPreservedAcrossRepair(t *testing.T) {
+	const nSpecial, pages, hashSize = 3, 2, 32
+	s := makeSpecialSlotSlice(nSpecial, pages)
+	if Detect(s) != AdHoc {
+		t.Fatal("special-slot fixture must be AdHoc")
+	}
+	if !Check(s, "test") {
+		t.Fatal("zeroed code slots must be stale")
+	}
+	cdOff := pages*4096 + 12 + 8
+	specialBefore := append([]byte(nil), s[cdOff+44:cdOff+44+nSpecial*hashSize]...)
+
+	changed, modified, err := Repair(s, "test")
+	if err != nil || !modified {
+		t.Fatalf("repair: %v %v", modified, err)
+	}
+	// Special slots untouched, byte for byte.
+	if !bytes.Equal(s[cdOff+44:cdOff+44+nSpecial*hashSize], specialBefore) {
+		t.Fatal("repair rewrote special slots; it may only touch code slots")
+	}
+	// Every journaled change lies inside the code-slot region.
+	slotsStart := int64(cdOff + 44 + nSpecial*hashSize)
+	slotsEnd := slotsStart + int64(pages*hashSize)
+	for _, c := range changed {
+		if c.Offset < slotsStart || c.Offset+int64(len(c.Old)) > slotsEnd {
+			t.Fatalf("change at %d outside code-slot region [%d,%d)", c.Offset, slotsStart, slotsEnd)
+		}
+	}
+	// And the repaired code slots verify: valid per engine and oracle.
+	if Check(s, "test") {
+		t.Fatal("must verify after repair")
+	}
+	if got := oracleStaleCount(t, s); got != 0 {
+		t.Fatalf("oracle sees %d stale slots after special-slot repair", got)
+	}
+}
+
+func TestRepairFatWithCMSSliceTouchesNothing(t *testing.T) {
+	// Repair's contract: "returns ErrCMSRepair without touching a byte
+	// if ANY slice carries a non-empty CMS signature". The repairable
+	// slice comes FIRST here, so a walker that repairs as it goes would
+	// modify slice 0 before discovering slice 1's CMS blob.
+	adhoc := makeRepairableSlice([]cdSpec{{csHashTypeSHA256, 32}}, 2, 0)
+	cms := makeRepairableSlice([]cdSpec{{csHashTypeSHA256, 32}}, 2, 100)
+	fat := makeFat([][]byte{adhoc, cms}, false)
+	before := append([]byte(nil), fat...)
+
+	changed, modified, err := Repair(fat, "test")
+	if err == nil {
+		t.Fatal("fat container with a CMS slice must refuse repair")
+	}
+	if modified || len(changed) != 0 {
+		t.Fatalf("refusal must report no modification: modified=%v changes=%d", modified, len(changed))
+	}
+	if !bytes.Equal(fat, before) {
+		t.Fatal("refusal touched bytes: the repairable slice was modified before the CMS slice was seen")
+	}
+}

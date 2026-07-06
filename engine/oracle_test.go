@@ -20,6 +20,12 @@ func oracleStaleCount(t *testing.T, data []byte) int {
 	t.Helper()
 	py, err := exec.LookPath("python3")
 	if err != nil {
+		// CI sets MACHOKEEPER_REQUIRE_ORACLE=1 so the triad's third leg
+		// can never silently vanish with a green build; locally the
+		// skip stays visible via -v.
+		if os.Getenv("MACHOKEEPER_REQUIRE_ORACLE") != "" {
+			t.Fatal("python3 not available but MACHOKEEPER_REQUIRE_ORACLE is set; the oracle leg must run")
+		}
 		t.Skip("python3 not available; oracle cross-validation skipped")
 	}
 	f := filepath.Join(t.TempDir(), "fixture")
@@ -88,5 +94,45 @@ func TestOracleAgreesOnFat(t *testing.T) {
 	}
 	if got := oracleStaleCount(t, fat); got != 0 {
 		t.Fatalf("oracle fat after: %d stale remain", got)
+	}
+}
+
+func TestOracleAgreesOnCodeLimitClamp(t *testing.T) {
+	// The one adversarial shape BOTH sides define behavior for: a
+	// codeLimit that truncates the final page. Engine and oracle each
+	// clamp to codeLimit; they must agree before and after repair.
+	s := makeRepairableSlice([]cdSpec{{csHashTypeSHA256, 32}}, 2, 0)
+	cdOff := 2*4096 + 12 + 8
+	putBE32(s, cdOff+32, uint32(2*4096-100))
+
+	if got := oracleStaleCount(t, s); got != 2 {
+		t.Fatalf("oracle before: %d, want 2", got)
+	}
+	if !Check(s, "fixture") {
+		t.Fatal("engine must agree: stale")
+	}
+	if _, modified, err := Repair(s, "fixture"); err != nil || !modified {
+		t.Fatalf("repair: %v %v", modified, err)
+	}
+	if got := oracleStaleCount(t, s); got != 0 {
+		t.Fatalf("oracle after: %d stale remain — engine and oracle disagree on clamping", got)
+	}
+	if Check(s, "fixture") {
+		t.Fatal("engine must pass after clamped repair")
+	}
+}
+
+func TestOracleAgreesOnSpecialSlots(t *testing.T) {
+	// Special slots offset the code-slot region via hashOffset; both
+	// sides must locate the code slots identically.
+	s := makeSpecialSlotSlice(3, 2)
+	if got := oracleStaleCount(t, s); got != 2 {
+		t.Fatalf("oracle before: %d, want 2", got)
+	}
+	if _, modified, err := Repair(s, "fixture"); err != nil || !modified {
+		t.Fatalf("repair: %v %v", modified, err)
+	}
+	if got := oracleStaleCount(t, s); got != 0 {
+		t.Fatalf("oracle after: %d stale — hashOffset handling diverges", got)
 	}
 }
