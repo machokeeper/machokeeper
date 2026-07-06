@@ -2,9 +2,13 @@ package hook
 
 import (
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"testing"
+
+	"github.com/machokeeper/machokeeper/engine"
+	"github.com/machokeeper/machokeeper/internal/machofixture"
 )
 
 func TestClosureDeltaSubtractsOldGeneration(t *testing.T) {
@@ -64,5 +68,61 @@ func TestScanGenerationFailsOpenOnDeltaError(t *testing.T) {
 	// blocked in repair mode.
 	if rc := ScanGeneration("bad", "", "repair"); rc != 0 {
 		t.Errorf("ScanGeneration fail-open = %d, want 0", rc)
+	}
+}
+
+func TestScanGenerationRefuseModeBlocksOnBroken(t *testing.T) {
+	prev := requisitesFn
+	defer func() { requisitesFn = prev }()
+
+	dir := t.TempDir()
+	broken := filepath.Join(dir, "abc-pkg")
+	os.MkdirAll(broken, 0o755)
+	blob := machofixture.Repairable(2)
+	if err := os.WriteFile(filepath.Join(broken, "tool"), blob, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	requisitesFn = func(path string) ([]string, error) {
+		return []string{broken}, nil
+	}
+	// Refuse mode: broken signature in the delta must block (exit 1).
+	if rc := ScanGeneration("new", "", "refuse"); rc != 1 {
+		t.Errorf("refuse mode with broken delta = %d, want 1", rc)
+	}
+	// The file must NOT have been repaired by a refuse-mode scan.
+	after, _ := os.ReadFile(filepath.Join(broken, "tool"))
+	if string(after) != string(blob) {
+		t.Error("refuse mode modified a file")
+	}
+}
+
+func TestScanGenerationRefuseModePassesWhenClean(t *testing.T) {
+	prev := requisitesFn
+	defer func() { requisitesFn = prev }()
+
+	dir := t.TempDir()
+	clean := filepath.Join(dir, "abc-pkg")
+	os.MkdirAll(clean, 0o755)
+	valid := machofixture.Repairable(2)
+	engine.Repair(valid, "x")
+	if err := os.WriteFile(filepath.Join(clean, "tool"), valid, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	requisitesFn = func(path string) ([]string, error) {
+		return []string{clean}, nil
+	}
+	if rc := ScanGeneration("new", "", "refuse"); rc != 0 {
+		t.Errorf("refuse mode with clean delta = %d, want 0", rc)
+	}
+}
+
+func TestScanGenerationRefuseModeEmptyDelta(t *testing.T) {
+	prev := requisitesFn
+	defer func() { requisitesFn = prev }()
+	requisitesFn = func(path string) ([]string, error) {
+		return []string{"/nix/store/a"}, nil // same for new and old
+	}
+	if rc := ScanGeneration("new", "old", "refuse"); rc != 0 {
+		t.Errorf("empty delta = %d, want 0", rc)
 	}
 }

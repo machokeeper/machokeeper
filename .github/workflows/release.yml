@@ -24,6 +24,15 @@ jobs:
           GOFLAGS: "-trimpath"
         run: |
           version="${GITHUB_REF_NAME}"
+          # The tag is interpolated into -ldflags (split on whitespace by
+          # go); only plain vX.Y.Z[-suffix] tags may reach it.
+          case "$version" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "refusing to build non-semver tag: $version"; exit 1 ;;
+          esac
+          case "$version" in
+            *[!A-Za-z0-9.-]*) echo "refusing tag with unexpected characters: $version"; exit 1 ;;
+          esac
           mkdir -p dist
           for pair in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64; do
             os="${pair%/*}"; arch="${pair#*/}"

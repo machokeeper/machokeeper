@@ -64,3 +64,93 @@ func TestParseSubstitutePathsIgnoresMalformedJSON(t *testing.T) {
 		t.Errorf("malformed input parsed to %v, want empty", got)
 	}
 }
+
+// withSeams swaps all four orchestration seams and restores them.
+func withSeams(t *testing.T, subs func([]string) []string, real func([]string) []string, pass func([]string) int, fix func([]string) int) {
+	t.Helper()
+	pSubs, pReal, pPass, pFix := willSubstituteFn, realiseFn, passthroughFn, fixFn
+	willSubstituteFn, realiseFn, passthroughFn, fixFn = subs, real, pass, fix
+	t.Cleanup(func() {
+		willSubstituteFn, realiseFn, passthroughFn, fixFn = pSubs, pReal, pPass, pFix
+	})
+}
+
+func TestRunPrefetchesRepairsAndSucceeds(t *testing.T) {
+	var fixed [][]string
+	var runs int
+	withSeams(t,
+		func([]string) []string { return []string{"/nix/store/aaa-x"} },
+		func(p []string) []string { return p },
+		func([]string) int { runs++; return 0 },
+		func(p []string) int { fixed = append(fixed, p); return 0 },
+	)
+	if rc := Run([]string{"nix", "build"}); rc != 0 {
+		t.Fatalf("rc = %d", rc)
+	}
+	if runs != 1 {
+		t.Errorf("command ran %d times, want 1", runs)
+	}
+	if len(fixed) != 1 || fixed[0][0] != "/nix/store/aaa-x" {
+		t.Errorf("fix calls = %v", fixed)
+	}
+}
+
+func TestRunRetriesOnceAfterRepair(t *testing.T) {
+	runs := 0
+	withSeams(t,
+		func([]string) []string { return []string{"/nix/store/aaa-x"} },
+		func(p []string) []string { return p },
+		func([]string) int {
+			runs++
+			if runs == 1 {
+				return 1 // first run fails
+			}
+			return 0 // retry succeeds
+		},
+		func([]string) int { return 0 },
+	)
+	if rc := Run([]string{"nix", "build"}); rc != 0 {
+		t.Fatalf("rc = %d, want 0 after retry", rc)
+	}
+	if runs != 2 {
+		t.Errorf("command ran %d times, want 2 (fail + one retry)", runs)
+	}
+}
+
+func TestRunNoRetryWhenNothingToRepair(t *testing.T) {
+	runs := 0
+	withSeams(t,
+		func([]string) []string { return nil }, // nothing substituted
+		func(p []string) []string { return p },
+		func([]string) int { runs++; return 3 },
+		func([]string) int { t.Error("fix must not be called"); return 0 },
+	)
+	if rc := Run([]string{"nix", "build"}); rc != 3 {
+		t.Fatalf("rc = %d, want the command's own exit code 3", rc)
+	}
+	if runs != 1 {
+		t.Errorf("command ran %d times, want 1 (no retry without a repair)", runs)
+	}
+}
+
+func TestRunRetryFailurePropagatesRetryExitCode(t *testing.T) {
+	runs := 0
+	withSeams(t,
+		func([]string) []string { return []string{"/nix/store/aaa-x"} },
+		func(p []string) []string { return p },
+		func([]string) int { runs++; return 7 }, // fails both times
+		func([]string) int { return 0 },
+	)
+	if rc := Run([]string{"nix", "build"}); rc != 7 {
+		t.Fatalf("rc = %d, want 7", rc)
+	}
+	if runs != 2 {
+		t.Errorf("runs = %d, want 2 (exactly one retry, never more)", runs)
+	}
+}
+
+func TestRunNoArgs(t *testing.T) {
+	if rc := Run(nil); rc != 1 {
+		t.Errorf("rc = %d, want 1", rc)
+	}
+}

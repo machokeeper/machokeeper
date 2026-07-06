@@ -39,6 +39,25 @@
         }
       );
 
+      # The full verification triad needs more than the build env:
+      # golangci-lint for the lint gate and python3 for the oracle
+      # cross-validation test (which silently skips without it).
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              go
+              golangci-lint
+              python3
+            ];
+          };
+        }
+      );
+
       apps = forAllSystems (system: {
         default = {
           type = "app";

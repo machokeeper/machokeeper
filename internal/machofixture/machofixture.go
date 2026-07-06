@@ -31,7 +31,7 @@ func Repairable(pages int) []byte {
 }
 
 // CMS returns the same shape but with a non-empty CMS blob wrapper
-// (Developer-ID style): engine.Detect classifies it Cms and repair
+// (Developer-ID style): engine.Detect classifies it CMS and repair
 // refuses it.
 func CMS(pages int) []byte {
 	return build(pages, 64)

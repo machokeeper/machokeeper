@@ -88,7 +88,8 @@ in
         The first time machokeeper activates, sweep the whole store
         once to repair anything already broken. Subsequent activations
         only scan the generation delta. A marker file records that the
-        sweep has run.
+        sweep has run. Not available on home-manager (no privileged
+        activation); use the hook + doctor there.
       '';
     };
   };
