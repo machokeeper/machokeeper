@@ -6,6 +6,7 @@ package doctor
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -26,6 +27,7 @@ type storeBackend interface {
 	Blockers(storePath string) ([]string, error)
 	Reregister(storePath string) error
 	ReconcileHash(storePath string) error
+	IsContentAddressed(storePath string) (bool, error)
 }
 
 type realStore struct{}
@@ -34,6 +36,9 @@ func (realStore) StorePathOf(f string) (string, bool) { return nixstore.StorePat
 func (realStore) Reregister(p string) error           { return nixstore.Reregister(p) }
 func (realStore) Blockers(p string) ([]string, error) { return storePathBlockers(p) }
 func (realStore) ReconcileHash(p string) error        { return reconcileHash(p) }
+func (realStore) IsContentAddressed(p string) (bool, error) {
+	return nixstore.IsContentAddressed(p)
+}
 
 // store is the backend used by Run; tests replace it.
 var store storeBackend = realStore{}
@@ -64,7 +69,7 @@ func scanFile(path string) *Finding {
 	}
 	defer func() { _ = f.Close() }()
 	peek := make([]byte, 4)
-	if n, _ := f.Read(peek); n < 4 || !engine.HasMachOMagic(peek) {
+	if _, err := io.ReadFull(f, peek); err != nil || !engine.HasMachOMagic(peek) {
 		return nil
 	}
 	data, err := os.ReadFile(path)
@@ -78,45 +83,35 @@ func scanFile(path string) *Finding {
 	if !engine.Check(data, path) {
 		return nil // signed and valid
 	}
+	// Repairable means a repair would actually leave the file valid —
+	// proven by a trial repair on the in-memory copy, not inferred from
+	// the signature class. An ad-hoc file whose signature is stale
+	// because it is UNVERIFIABLE (malformed CodeDirectory, unsupported
+	// hash type) has nothing repair can rewrite and must be reported
+	// unrepairable, not queued for a fix that will no-op.
+	repairable := false
+	if kind == engine.AdHoc {
+		trial := append([]byte(nil), data...)
+		if _, modified, err := engine.Repair(trial, path); err == nil && modified && !engine.Check(trial, path) {
+			repairable = true
+		}
+	}
+	class := kind.String()
+	if kind == engine.AdHoc && !repairable {
+		class = "ad-hoc (unverifiable)"
+	}
 	return &Finding{
 		File:       path,
 		Kind:       kind,
-		Class:      kind.String(),
-		Repairable: kind == engine.AdHoc,
+		Class:      class,
+		Repairable: repairable,
 	}
 }
 
-// walk scans a file or directory tree (symlinks never followed).
-func walk(root string, visit func(*Finding)) error {
-	info, err := os.Lstat(root)
-	if err != nil {
-		return err
-	}
-	if info.Mode().IsRegular() {
-		if f := scanFile(root); f != nil {
-			visit(f)
-		}
-		return nil
-	}
-	if !info.IsDir() {
-		return nil
-	}
-	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil // skip unreadable entries, keep walking
-		}
-		if d.Type().IsRegular() {
-			if f := scanFile(p); f != nil {
-				visit(f)
-			}
-		}
-		return nil
-	})
-}
-
-// walkParallel is walk with the per-file scan fanned out over a worker
-// pool: a whole-store scan is dominated by reading and hashing file
-// contents, which parallelises cleanly. Directory traversal stays
+// walkParallel scans a file or directory tree (symlinks never
+// followed) with the per-file scan fanned out over a worker pool: a
+// whole-store scan is dominated by reading and hashing file contents,
+// which parallelises cleanly. Directory traversal stays
 // single-threaded; findings are delivered from a single goroutine, so
 // the visit callback needs no locking.
 func walkParallel(root string, visit func(*Finding)) error {
@@ -298,6 +293,23 @@ func Run(args []string) int {
 		// copy. With --fix-live, repair in place and reconcile the hash
 		// row directly (below).
 		reregister := g.storePath != ""
+
+		// A content-addressed path's name IS a function of its bytes:
+		// repairing it would break the content address. Refusal class
+		// (THREAT-MODEL); no --fix variant overrides it. A failed query
+		// also refuses — unknown must never be treated as repairable.
+		if g.storePath != "" {
+			ca, err := store.IsContentAddressed(g.storePath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "fix: %s: cannot determine if content-addressed, refusing: %v\n", g.storePath, err)
+				continue
+			}
+			if ca {
+				say("SKIP    %s: content-addressed; repairing would break its content address (see THREAT-MODEL.md)\n", g.storePath)
+				continue
+			}
+		}
+
 		if g.storePath != "" && !fixLive {
 			blockers, err := store.Blockers(g.storePath)
 			if err != nil {
@@ -313,7 +325,10 @@ func Run(args []string) int {
 		}
 
 		// Repair every broken file in the group on disk, hardlink-safely.
-		var groupChanges []journalEntry
+		// Each file's changes go into the journal the moment its rename
+		// lands: a failure later in the group (or at re-registration)
+		// must not lose the undo records of bytes already on disk.
+		repairedInGroup := 0
 		ok := true
 		for _, f := range g.files {
 			changes, err := repairFileHardlinkSafe(f.File)
@@ -322,7 +337,8 @@ func Run(args []string) int {
 				ok = false
 				break
 			}
-			groupChanges = append(groupChanges, journalEntry{File: f.File, Time: time.Now(), Changes: changes})
+			journal = append(journal, journalEntry{File: f.File, Time: time.Now(), Changes: changes})
+			repairedInGroup++
 			say("REPAIRED  %s  (%d slot(s))\n", f.File, len(changes))
 		}
 		if !ok {
@@ -347,14 +363,16 @@ func Run(args []string) int {
 			}
 			say("re-registered %s\n", g.storePath)
 		}
-		journal = append(journal, groupChanges...)
-		fixed += len(groupChanges)
+		fixed += repairedInGroup
 	}
 
 	if len(journal) > 0 {
 		if j, err := json.MarshalIndent(journal, "", " "); err == nil {
-			_ = os.WriteFile(journalPath, j, 0o600)
-			say("\nundo journal: %s\n", journalPath)
+			if werr := os.WriteFile(journalPath, j, 0o600); werr != nil {
+				fmt.Fprintf(os.Stderr, "fix: writing undo journal %s: %v\n", journalPath, werr)
+			} else {
+				say("\nundo journal: %s\n", journalPath)
+			}
 		}
 	}
 	say("repaired %d file(s)\n", fixed)
@@ -369,12 +387,16 @@ func Run(args []string) int {
 	return 0
 }
 
+// journalDir is the preferred undo-journal location; tests point it at
+// a TempDir so they never probe (or pollute) the real /nix/var.
+var journalDir = "/nix/var/machokeeper"
+
 // journalFile returns a writable path for the undo journal: a
-// timestamped file under /nix/var/machokeeper when writable (the module
-// runs there), else the current directory (interactive doctor use).
+// timestamped file under journalDir when writable (the module runs
+// there), else the current directory (interactive doctor use).
 func journalFile() string {
 	name := fmt.Sprintf("machokeeper-undo-%d.json", time.Now().Unix())
-	dir := "/nix/var/machokeeper"
+	dir := journalDir
 	if err := os.MkdirAll(dir, 0o750); err == nil {
 		if f, err := os.CreateTemp(dir, ".probe-"); err == nil {
 			_ = f.Close()
@@ -444,31 +466,133 @@ func repairFileHardlinkSafe(path string) ([]engine.Change, error) {
 	if engine.Check(data, path) {
 		return nil, fmt.Errorf("still fails verification after repair; not writing")
 	}
+	if err := replaceFile(path, data); err != nil {
+		return nil, err
+	}
+	return changes, nil
+}
+
+// replaceFile writes data to a sibling temp file and renames it over
+// path, preserving the original mode — the hardlink-safe write both
+// repair and undo use.
+func replaceFile(path string, data []byte) error {
 	st, err := os.Stat(path)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".machokeeper-*")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	tmpName := tmp.Name()
 	defer func() { _ = os.Remove(tmpName) }() // no-op after a successful rename
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
-		return nil, err
+		return err
 	}
 	if err := tmp.Close(); err != nil {
-		return nil, err
+		return err
 	}
 	if err := os.Chmod(tmpName, st.Mode()); err != nil {
-		return nil, err
+		return err
 	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return nil, err
+	return os.Rename(tmpName, path)
+}
+
+// Undo implements `machokeeper undo <journal.json>`: restore the exact
+// pre-repair bytes recorded by a --fix run. Each file is verified to
+// still hold the repaired bytes at every journaled offset before any
+// write — a file that changed since the repair is refused, never
+// spliced. The write is temp+rename, the same hardlink-safe route
+// repair takes. Note the store DB hash is NOT reconciled here; undo
+// restores bytes so `nix store verify --repair` can take over.
+func Undo(args []string) int {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "undo: usage: machokeeper undo <machokeeper-undo-*.json>")
+		return 1
 	}
-	return changes, nil
+	raw, err := os.ReadFile(args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "undo: %v\n", err)
+		return 1
+	}
+	var journal []journalEntry
+	if err := json.Unmarshal(raw, &journal); err != nil {
+		fmt.Fprintf(os.Stderr, "undo: %s: %v\n", args[0], err)
+		return 1
+	}
+	rc := 0
+	for _, e := range journal {
+		if err := undoFile(e); err != nil {
+			fmt.Fprintf(os.Stderr, "undo: %s: %v\n", e.File, err)
+			rc = 1
+			continue
+		}
+		fmt.Printf("RESTORED  %s  (%d slot(s))\n", e.File, len(e.Changes))
+	}
+	return rc
+}
+
+// undoFile restores one journal entry, refusing unless every journaled
+// offset still holds the repaired bytes. Changes are un-applied in
+// reverse journal order — the repair wrote them forward, so if two
+// entries ever overlap, only last-undone-first restores the original
+// bytes exactly. Bounds are validated up front so a refusal never
+// leaves a half-restored buffer.
+func undoFile(e journalEntry) error {
+	// Same discipline as the scan path: only regular files. A journaled
+	// path that became a symlink since the repair is refused, not
+	// followed.
+	st, err := os.Lstat(e.File)
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("not a regular file (mode %v); refusing", st.Mode())
+	}
+	data, err := os.ReadFile(e.File)
+	if err != nil {
+		return err
+	}
+	for _, c := range e.Changes {
+		// Subtraction form: journals are user-editable JSON, so an
+		// Offset near MaxInt64 must refuse cleanly, not wrap the sum.
+		if c.Offset < 0 || int64(len(c.Old)) > int64(len(data)) || c.Offset > int64(len(data))-int64(len(c.Old)) {
+			return fmt.Errorf("journal offset %d out of bounds (file is %d bytes)", c.Offset, len(data))
+		}
+	}
+	warned := false
+	for i := len(e.Changes) - 1; i >= 0; i-- {
+		c := e.Changes[i]
+		end := c.Offset + int64(len(c.Old))
+		if len(c.New) == 0 {
+			// A journal from before the New field existed: the
+			// changed-since-repair verification cannot run. Proceed —
+			// refusing would strand every pre-upgrade journal — but say
+			// so once.
+			if !warned {
+				fmt.Fprintf(os.Stderr, "undo: %s: journal has no repaired-bytes record; restoring without changed-since-repair verification\n", e.File)
+				warned = true
+			}
+		} else if !bytesEq(data[c.Offset:end], c.New) {
+			return fmt.Errorf("slot at offset %d does not hold the repaired bytes; file changed since repair, refusing", c.Offset)
+		}
+		copy(data[c.Offset:], c.Old)
+	}
+	return replaceFile(e.File, data)
+}
+
+func bytesEq(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Check implements `machokeeper check`: exit 0 all valid, 2 stale or
@@ -481,7 +605,7 @@ func Check(args []string) int {
 	}
 	stale := 0
 	for _, p := range args {
-		if err := walk(p, func(f *Finding) { stale++ }); err != nil {
+		if err := walkParallel(p, func(f *Finding) { stale++ }); err != nil {
 			fmt.Fprintf(os.Stderr, "check: %s: %v\n", p, err)
 			return 1
 		}

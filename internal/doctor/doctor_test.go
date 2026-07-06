@@ -16,6 +16,8 @@ import (
 type fakeStore struct {
 	storePaths map[string]string // file -> containing store path
 	rooted     map[string]bool   // store path -> has blockers
+	ca         map[string]bool   // store path -> content-addressed
+	failCA     bool              // IsContentAddressed returns an error
 	reregister []string
 	reconcile  []string
 	failReg    bool
@@ -42,6 +44,12 @@ func (f *fakeStore) ReconcileHash(sp string) error {
 	f.reconcile = append(f.reconcile, sp)
 	return nil
 }
+func (f *fakeStore) IsContentAddressed(sp string) (bool, error) {
+	if f.failCA {
+		return false, errReg
+	}
+	return f.ca[sp], nil
+}
 
 var errReg = &os.PathError{Op: "reregister", Path: "x", Err: syscall.EIO}
 
@@ -49,7 +57,16 @@ func withStore(t *testing.T, s storeBackend) {
 	t.Helper()
 	prev := store
 	store = s
-	t.Cleanup(func() { store = prev })
+	// Keep journal probing away from the real /nix/var: point the
+	// preferred dir below a regular FILE so MkdirAll fails and the cwd
+	// fallback (what these tests assert on) is always taken.
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prevDir := journalDir
+	journalDir = filepath.Join(blocker, "sub")
+	t.Cleanup(func() { store = prev; journalDir = prevDir })
 }
 
 // writeFixture writes a fixture blob and asserts the engine sees it the
@@ -286,13 +303,22 @@ func assertJournalUndoes(t *testing.T, dir, repaired string) {
 	if len(j) == 0 || len(j[0].Changes) == 0 {
 		t.Fatal("journal has no changes recorded")
 	}
-	// Apply the journal's old bytes back and confirm the file becomes
-	// stale again (byte-exact reversal of a slot-only repair).
+	// Apply the journal's old bytes back (entries for THIS file only —
+	// a multi-file journal's other offsets belong to other files) and
+	// confirm the file becomes stale again.
+	found := false
 	data, _ := os.ReadFile(repaired)
 	for _, e := range j {
+		if e.File != repaired {
+			continue
+		}
+		found = true
 		for _, c := range e.Changes {
 			copy(data[c.Offset:], c.Old)
 		}
+	}
+	if !found {
+		t.Fatalf("journal has no entry for %s", repaired)
 	}
 	if !engine.Check(data, repaired) {
 		t.Error("undo journal did not restore the original (stale) bytes")
@@ -333,4 +359,376 @@ func fmtInt(i int) string {
 		i /= 10
 	}
 	return string(b)
+}
+
+func TestDoctorFixPartialGroupFailureStillJournals(t *testing.T) {
+	// Two repairable files in ONE store path; the second one's directory
+	// is read-only, so its repair fails after the first file has already
+	// been renamed into place. The already-repaired file must still get
+	// an undo journal entry — a mid-group failure must not discard the
+	// records of bytes that are already on disk.
+	dir := t.TempDir()
+	sp := filepath.Join(dir, "abc-pkg")
+	binDir := filepath.Join(sp, "bin")
+	libDir := filepath.Join(sp, "libexec")
+	os.MkdirAll(binDir, 0o755)
+	os.MkdirAll(libDir, 0o755)
+	a := filepath.Join(binDir, "a-tool")
+	b := filepath.Join(libDir, "b-tool")
+	fs := &fakeStore{storePaths: map[string]string{a: sp, b: sp}}
+	withStore(t, fs)
+	writeFixture(t, a, machofixture.Repairable(2), engine.AdHoc, true)
+	writeFixture(t, b, machofixture.Repairable(2), engine.AdHoc, true)
+	if err := os.Chmod(libDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(libDir, 0o755) })
+
+	chdir(t, dir)
+	if rc := Run([]string{"--quiet", "--fix", a, b}); rc != 2 {
+		t.Errorf("rc = %d, want 2 (b was not repaired)", rc)
+	}
+	dataA, _ := os.ReadFile(a)
+	if engine.Check(dataA, a) {
+		t.Fatal("a should have been repaired before b failed")
+	}
+	// a's on-disk bytes changed, so the journal must record them.
+	assertJournalUndoes(t, dir, a)
+}
+
+func TestDoctorFixJournalsWhenReregisterFails(t *testing.T) {
+	// Re-registration fails after the file was repaired and renamed into
+	// place: the byte changes are on disk, so the journal must record
+	// them even though the group did not complete.
+	dir := t.TempDir()
+	sp := filepath.Join(dir, "abc-pkg")
+	os.MkdirAll(filepath.Join(sp, "bin"), 0o755)
+	f := filepath.Join(sp, "bin", "tool")
+	fs := &fakeStore{storePaths: map[string]string{f: sp}, failReg: true}
+	withStore(t, fs)
+	writeFixture(t, f, machofixture.Repairable(2), engine.AdHoc, true)
+
+	chdir(t, dir)
+	if rc := Run([]string{"--quiet", "--fix", f}); rc != 2 {
+		t.Errorf("rc = %d, want 2 (repaired on disk but not re-registered)", rc)
+	}
+	data, _ := os.ReadFile(f)
+	if engine.Check(data, f) {
+		t.Fatal("file should have been repaired on disk")
+	}
+	assertJournalUndoes(t, dir, f)
+}
+
+func TestUndoRestoresOriginalBytes(t *testing.T) {
+	withStore(t, &fakeStore{})
+	dir := t.TempDir()
+	f := filepath.Join(dir, "broken")
+	blob := machofixture.Repairable(3)
+	original := append([]byte(nil), blob...)
+	writeFixture(t, f, blob, engine.AdHoc, true)
+
+	chdir(t, dir)
+	if rc := Run([]string{"--quiet", "--fix", f}); rc != 0 {
+		t.Fatalf("fix rc = %d", rc)
+	}
+	journals, _ := filepath.Glob(filepath.Join(dir, "machokeeper-undo-*.json"))
+	if len(journals) != 1 {
+		t.Fatalf("journals = %v, want exactly 1", journals)
+	}
+	repairedInode := inodeOf(t, f)
+
+	if rc := Undo([]string{journals[0]}); rc != 0 {
+		t.Fatalf("undo rc = %d", rc)
+	}
+	after, _ := os.ReadFile(f)
+	if string(after) != string(original) {
+		t.Error("undo did not restore the original bytes exactly")
+	}
+	// Hardlink-safe like repair: a fresh inode, not an in-place write.
+	if inodeOf(t, f) == repairedInode {
+		t.Error("undo wrote in place; expected temp+rename")
+	}
+}
+
+func TestUndoRefusesWhenFileChangedSinceRepair(t *testing.T) {
+	withStore(t, &fakeStore{})
+	dir := t.TempDir()
+	f := filepath.Join(dir, "broken")
+	writeFixture(t, f, machofixture.Repairable(2), engine.AdHoc, true)
+
+	chdir(t, dir)
+	if rc := Run([]string{"--quiet", "--fix", f}); rc != 0 {
+		t.Fatalf("fix rc = %d", rc)
+	}
+	journals, _ := filepath.Glob(filepath.Join(dir, "machokeeper-undo-*.json"))
+	// The file was replaced since the repair: undo must refuse rather
+	// than blindly splice stale bytes into unrelated content.
+	if err := os.WriteFile(f, []byte("something else entirely"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if rc := Undo([]string{journals[0]}); rc == 0 {
+		t.Fatal("undo of a changed file must fail")
+	}
+	after, _ := os.ReadFile(f)
+	if string(after) != "something else entirely" {
+		t.Error("undo modified a file it should have refused")
+	}
+}
+
+func TestUndoUsage(t *testing.T) {
+	if rc := Undo(nil); rc != 1 {
+		t.Errorf("undo with no args = %d, want 1", rc)
+	}
+	if rc := Undo([]string{"/nonexistent/journal.json"}); rc != 1 {
+		t.Errorf("undo with missing journal = %d, want 1", rc)
+	}
+}
+
+func TestDoctorFixRefusesContentAddressedPath(t *testing.T) {
+	dir := t.TempDir()
+	sp := filepath.Join(dir, "abc-ca-pkg")
+	os.MkdirAll(filepath.Join(sp, "bin"), 0o755)
+	f := filepath.Join(sp, "bin", "tool")
+	fs := &fakeStore{
+		storePaths: map[string]string{f: sp},
+		ca:         map[string]bool{sp: true},
+	}
+	withStore(t, fs)
+	blob := machofixture.Repairable(2)
+	writeFixture(t, f, blob, engine.AdHoc, true)
+
+	chdir(t, dir)
+	// CA path: refused under --fix AND --fix-live; bytes untouched.
+	for _, flag := range []string{"--fix", "--fix-live"} {
+		if rc := Run([]string{"--quiet", flag, f}); rc != 2 {
+			t.Errorf("%s rc = %d, want 2 (CA path refused)", flag, rc)
+		}
+		after, _ := os.ReadFile(f)
+		if !engine.Check(after, f) {
+			t.Fatalf("%s modified a content-addressed path", flag)
+		}
+	}
+	if len(fs.reregister)+len(fs.reconcile) != 0 {
+		t.Error("CA path must not be re-registered or reconciled")
+	}
+}
+
+func TestDoctorFixFailsClosedWhenCAQueryErrors(t *testing.T) {
+	dir := t.TempDir()
+	sp := filepath.Join(dir, "abc-pkg")
+	os.MkdirAll(filepath.Join(sp, "bin"), 0o755)
+	f := filepath.Join(sp, "bin", "tool")
+	fs := &fakeStore{storePaths: map[string]string{f: sp}, failCA: true}
+	withStore(t, fs)
+	writeFixture(t, f, machofixture.Repairable(2), engine.AdHoc, true)
+
+	chdir(t, dir)
+	if rc := Run([]string{"--quiet", "--fix", f}); rc != 2 {
+		t.Errorf("rc = %d, want 2 (unknown CA status must refuse)", rc)
+	}
+	after, _ := os.ReadFile(f)
+	if !engine.Check(after, f) {
+		t.Error("file modified although CA status was unknown")
+	}
+}
+
+func TestDoctorJSONOutput(t *testing.T) {
+	withStore(t, &fakeStore{})
+	dir := t.TempDir()
+	broken := filepath.Join(dir, "broken.dylib")
+	cms := filepath.Join(dir, "devid.dylib")
+	writeFixture(t, broken, machofixture.Repairable(2), engine.AdHoc, true)
+	writeFixture(t, cms, machofixture.CMS(2), engine.CMS, true)
+
+	out := captureStdout(t, func() {
+		if rc := Run([]string{"--json", dir}); rc != 2 {
+			t.Errorf("--json with findings rc = %d, want 2", rc)
+		}
+	})
+	var findings []struct {
+		File       string `json:"file"`
+		Class      string `json:"class"`
+		Repairable bool   `json:"repairable"`
+	}
+	if err := json.Unmarshal([]byte(out), &findings); err != nil {
+		t.Fatalf("--json output is not valid JSON: %v\n%s", err, out)
+	}
+	if len(findings) != 2 {
+		t.Fatalf("findings = %d, want 2", len(findings))
+	}
+	// Sorted by file: broken.dylib then devid.dylib.
+	if findings[0].File != broken || !findings[0].Repairable || findings[0].Class != "ad-hoc" {
+		t.Errorf("finding[0] = %+v", findings[0])
+	}
+	if findings[1].File != cms || findings[1].Repairable || findings[1].Class != "CMS (Developer ID)" {
+		t.Errorf("finding[1] = %+v", findings[1])
+	}
+
+	// Empty scan: valid JSON (empty array or null), exit 0.
+	empty := t.TempDir()
+	out = captureStdout(t, func() {
+		if rc := Run([]string{"--json", empty}); rc != 0 {
+			t.Errorf("--json empty rc = %d, want 0", rc)
+		}
+	})
+	var none []json.RawMessage
+	if err := json.Unmarshal([]byte(out), &none); err != nil {
+		t.Fatalf("--json empty output invalid: %v\n%s", err, out)
+	}
+	if len(none) != 0 {
+		t.Errorf("empty scan produced %d findings", len(none))
+	}
+}
+
+func TestDoctorReportsUnverifiableAdHocAsUnrepairable(t *testing.T) {
+	withStore(t, &fakeStore{})
+	dir := t.TempDir()
+	f := filepath.Join(dir, "mangled")
+	blob := machofixture.Repairable(2)
+	// Mangle the CodeDirectory's hash type to an unsupported value: the
+	// signature is stale-per-Check but repair cannot fix it.
+	cdOff := 2*4096 + 12 + 8
+	blob[cdOff+37] = 99
+	writeFixture(t, f, blob, engine.AdHoc, true)
+	before := append([]byte(nil), blob...)
+
+	out := captureStdout(t, func() {
+		if rc := Run([]string{"--json", f}); rc != 2 {
+			t.Errorf("rc = %d, want 2", rc)
+		}
+	})
+	var findings []struct {
+		Class      string `json:"class"`
+		Repairable bool   `json:"repairable"`
+	}
+	if err := json.Unmarshal([]byte(out), &findings); err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 || findings[0].Repairable {
+		t.Fatalf("unverifiable ad-hoc must be unrepairable: %+v", findings)
+	}
+	if findings[0].Class != "ad-hoc (unverifiable)" {
+		t.Errorf("class = %q", findings[0].Class)
+	}
+	// And --fix must not touch it (or claim success).
+	if rc := Run([]string{"--quiet", "--fix", f}); rc != 2 {
+		t.Errorf("--fix rc = %d, want 2", rc)
+	}
+	after, _ := os.ReadFile(f)
+	if string(after) != string(before) {
+		t.Error("unrepairable file was modified")
+	}
+}
+
+func TestWalkParallelSingleFileAndError(t *testing.T) {
+	withStore(t, &fakeStore{})
+	dir := t.TempDir()
+	f := filepath.Join(dir, "one")
+	writeFixture(t, f, machofixture.Repairable(2), engine.AdHoc, true)
+
+	var count int
+	if err := walkParallel(f, func(*Finding) { count++ }); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Errorf("single-file walk found %d, want 1", count)
+	}
+	if err := walkParallel(filepath.Join(dir, "nonexistent"), func(*Finding) {}); err == nil {
+		t.Error("nonexistent root must return an error")
+	}
+}
+
+func TestScanFileEdgeCases(t *testing.T) {
+	dir := t.TempDir()
+	// Shorter than the magic.
+	tiny := filepath.Join(dir, "tiny")
+	os.WriteFile(tiny, []byte{0xfe, 0xed}, 0o644)
+	if f := scanFile(tiny); f != nil {
+		t.Errorf("tiny file: %+v", f)
+	}
+	// Magic but nothing else: Detect must say None.
+	magicOnly := filepath.Join(dir, "magic-only")
+	blob := make([]byte, 16)
+	blob[0], blob[1], blob[2], blob[3] = 0xcf, 0xfa, 0xed, 0xfe // MH_MAGIC_64 LE
+	os.WriteFile(magicOnly, blob, 0o644)
+	if f := scanFile(magicOnly); f != nil {
+		t.Errorf("magic-only file: %+v", f)
+	}
+	// Valid signed file: healthy, no finding.
+	valid := machofixture.Repairable(2)
+	engine.Repair(valid, "x")
+	good := filepath.Join(dir, "good")
+	os.WriteFile(good, valid, 0o644)
+	if f := scanFile(good); f != nil {
+		t.Errorf("healthy file: %+v", f)
+	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	done := make(chan string)
+	go func() {
+		var buf []byte
+		tmp := make([]byte, 4096)
+		for {
+			n, err := r.Read(tmp)
+			buf = append(buf, tmp[:n]...)
+			if err != nil {
+				break
+			}
+		}
+		done <- string(buf)
+	}()
+	defer func() {
+		os.Stdout = old
+	}()
+	fn()
+	w.Close()
+	os.Stdout = old
+	return <-done
+}
+
+func TestDoctorFixMultiFileGroupReregistersOnce(t *testing.T) {
+	dir := t.TempDir()
+	sp := filepath.Join(dir, "abc-pkg")
+	os.MkdirAll(filepath.Join(sp, "bin"), 0o755)
+	a := filepath.Join(sp, "bin", "a")
+	b := filepath.Join(sp, "bin", "b")
+	c := filepath.Join(sp, "bin", "c")
+	fs := &fakeStore{storePaths: map[string]string{a: sp, b: sp, c: sp}}
+	withStore(t, fs)
+	for _, f := range []string{a, b, c} {
+		writeFixture(t, f, machofixture.Repairable(2), engine.AdHoc, true)
+	}
+
+	chdir(t, dir)
+	if rc := Run([]string{"--quiet", "--fix", a, b, c}); rc != 0 {
+		t.Fatalf("rc = %d", rc)
+	}
+	if len(fs.reregister) != 1 || fs.reregister[0] != sp {
+		t.Errorf("Reregister calls = %v, want exactly one for %s", fs.reregister, sp)
+	}
+	for _, f := range []string{a, b, c} {
+		data, _ := os.ReadFile(f)
+		if engine.Check(data, f) {
+			t.Errorf("%s still stale", f)
+		}
+	}
+	// All three files journaled.
+	entries, _ := filepath.Glob(filepath.Join(dir, "machokeeper-undo-*.json"))
+	if len(entries) != 1 {
+		t.Fatalf("journals = %v", entries)
+	}
+	var j []journalEntry
+	raw, _ := os.ReadFile(entries[0])
+	json.Unmarshal(raw, &j)
+	if len(j) != 3 {
+		t.Errorf("journal entries = %d, want 3", len(j))
+	}
 }

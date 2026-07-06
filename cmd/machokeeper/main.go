@@ -22,6 +22,7 @@ Usage:
   machokeeper doctor --fix-live PATH   also repair GC-rooted paths (e.g. a login shell) in place
   machokeeper doctor --scan --json     machine-readable findings (implies report-only)
   machokeeper check PATH...            exit 2 if any signature is stale or unverifiable
+  machokeeper undo JOURNAL.json        restore the exact pre-repair bytes from an undo journal
   machokeeper wrap -- nix build ...    run a nix command, repairing what it substitutes first
   machokeeper version
   machokeeper help
@@ -30,8 +31,8 @@ Without --fix, doctor only reports. --fix repairs unrooted store paths
 by re-registering them (correct NAR hash); --fix-live additionally
 repairs rooted paths in place and reconciles their hash. Repair rewrites
 only stale hash slots (byte-exact undo journal written next to the
-report) and never touches Developer-ID-signed files or content-addressed
-paths.`
+report; "machokeeper undo" applies it) and never touches
+Developer-ID-signed files or content-addressed paths.`
 
 // version is set at build time via -ldflags "-X main.version=<tag>".
 var version = "dev"
@@ -46,6 +47,8 @@ func main() {
 		os.Exit(doctor.Run(os.Args[2:]))
 	case "check":
 		os.Exit(doctor.Check(os.Args[2:]))
+	case "undo":
+		os.Exit(doctor.Undo(os.Args[2:]))
 	// Module-driven, non-interactive entry points (see the nix-darwin /
 	// NixOS / home-manager module). All fail open.
 	case "post-build-hook":
