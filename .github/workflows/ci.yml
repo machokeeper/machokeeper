@@ -4,6 +4,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: "27 6 * * *" # daily: real-binary validation against cache.nixos.org
+  workflow_dispatch:
 
 permissions: read-all
 
@@ -59,3 +62,39 @@ jobs:
       - run: nix flake check
       - run: nix build .#default
       - run: ./result/bin/machokeeper help
+
+  # Real-binary validation against cache.nixos.org: expensive and
+  # network/cache-dependent, so it runs on schedule and on demand, not on
+  # every PR. Fetches genuinely broken binaries named by the scope scanner
+  # and drives the shipped tool against them.
+  real-binaries-linux:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: "experimental-features = nix-command flakes"
+      - run: go build -o machokeeper ./cmd/machokeeper
+      - name: Validate against real broken cache binaries
+        run: |
+          python3 -u scripts/validate-real-binaries.py "$PWD/machokeeper" --channel darwin --n 4
+          python3 -u scripts/validate-real-binaries.py "$PWD/machokeeper" --channel unstable --n 4
+
+  real-binaries-darwin:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: "experimental-features = nix-command flakes"
+      - run: go build -o machokeeper ./cmd/machokeeper
+      - name: Functional test — repair, then Apple's codesign must accept
+        run: bash scripts/darwin-functional.sh "$PWD/machokeeper"
