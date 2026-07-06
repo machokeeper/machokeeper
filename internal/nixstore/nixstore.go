@@ -4,6 +4,7 @@
 package nixstore
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -91,13 +92,25 @@ func DumpNAR(path string) ([]byte, error) {
 // `deriver` come from a prior query; `narHash` is the sha256 of the
 // repaired NAR in `sha256:<base32>` form.
 func RegisterValidity(storePath, deriver, narHash string, narSize int64, references []string) error {
-	// The registration format read on stdin is, per line group:
-	//   <store path>
-	//   <deriver or empty>
-	//   <narHash>
-	//   <narSize>            (with --hash-given)
-	//   <#references>
-	//   <reference>...       (one per line)
+	cmd := exec.Command("nix-store", "--register-validity", "--reregister", "--hash-given")
+	cmd.Stdin = strings.NewReader(registrationLines(storePath, deriver, narHash, narSize, references))
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("re-registering validity of %s: %w", storePath, err)
+	}
+	return nil
+}
+
+// registrationLines builds the stdin format `nix-store
+// --register-validity --hash-given` reads, per line group:
+//
+//	<store path>
+//	<deriver or empty>
+//	<narHash>
+//	<narSize>            (with --hash-given)
+//	<#references>
+//	<reference>...       (one per line)
+func registrationLines(storePath, deriver, narHash string, narSize int64, references []string) string {
 	var b strings.Builder
 	fmt.Fprintln(&b, storePath)
 	fmt.Fprintln(&b, deriver)
@@ -107,13 +120,55 @@ func RegisterValidity(storePath, deriver, narHash string, narSize int64, referen
 	for _, r := range references {
 		fmt.Fprintln(&b, r)
 	}
-	cmd := exec.Command("nix-store", "--register-validity", "--reregister", "--hash-given")
-	cmd.Stdin = strings.NewReader(b.String())
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("re-registering validity of %s: %w", storePath, err)
+	return b.String()
+}
+
+// IsContentAddressed reports whether `storePath` is content-addressed
+// (its name derives from its bytes, so a repair would break the
+// address). Reads the `ca` field of `nix path-info --json`, handling
+// both the pre-2.19 array form and the newer path-keyed object form.
+// Errors are returned, not swallowed: callers must fail closed.
+func IsContentAddressed(storePath string) (bool, error) {
+	out, err := exec.Command("nix", "--extra-experimental-features", "nix-command",
+		"path-info", "--json", storePath).Output()
+	if err != nil {
+		return false, fmt.Errorf("querying path info of %s: %w", storePath, err)
 	}
-	return nil
+	return parsePathInfoCA(out, storePath)
+}
+
+// parsePathInfoCA reads the `ca` field for storePath out of a
+// `nix path-info --json` response, in either the pre-2.19 array form or
+// the newer path-keyed object form. Any shape it cannot positively
+// resolve is an error, never a false.
+func parsePathInfoCA(out []byte, storePath string) (bool, error) {
+	type info struct {
+		Path string `json:"path"`
+		CA   string `json:"ca"`
+	}
+	var arr []info
+	if err := json.Unmarshal(out, &arr); err == nil {
+		for _, i := range arr {
+			if i.Path == storePath || len(arr) == 1 {
+				return i.CA != "", nil
+			}
+		}
+		return false, fmt.Errorf("path info response does not name %s", storePath)
+	}
+	var obj map[string]info
+	if err := json.Unmarshal(out, &obj); err != nil {
+		return false, fmt.Errorf("parsing path info of %s: %w", storePath, err)
+	}
+	if i, ok := obj[storePath]; ok {
+		return i.CA != "", nil
+	}
+	// Single-entry response keyed by a differently-normalised name.
+	if len(obj) == 1 {
+		for _, i := range obj {
+			return i.CA != "", nil
+		}
+	}
+	return false, fmt.Errorf("path info response does not name %s", storePath)
 }
 
 // PathInfo returns the deriver and references of `storePath`, needed to
@@ -149,8 +204,16 @@ func Reregister(storePath string) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = os.Remove(tmp.Name()) }()
 	defer func() { _ = tmp.Close() }()
+	// The export is the only copy of the path between delete and a
+	// successful import, so it is removed only after import succeeds; on
+	// an import failure it is kept and named in the error.
+	imported := false
+	defer func() {
+		if imported {
+			_ = os.Remove(tmp.Name())
+		}
+	}()
 
 	// export: streams the NAR from disk (repaired contents) plus the
 	// path's metadata; the NAR hash is recomputed on import.
@@ -158,13 +221,16 @@ func Reregister(storePath string) error {
 	exp.Stdout = tmp
 	exp.Stderr = os.Stderr
 	if err := exp.Run(); err != nil {
+		imported = true // nothing was deleted; the export is worthless
 		return fmt.Errorf("exporting %s: %w", storePath, err)
 	}
 	if _, err := tmp.Seek(0, 0); err != nil {
+		imported = true
 		return err
 	}
 
 	if out, err := exec.Command("nix-store", "--delete", storePath).CombinedOutput(); err != nil {
+		imported = true
 		return fmt.Errorf("deleting %s (rooted or referenced?): %w: %s", storePath, err, strings.TrimSpace(string(out)))
 	}
 
@@ -172,7 +238,9 @@ func Reregister(storePath string) error {
 	imp.Stdin = tmp
 	imp.Stderr = os.Stderr
 	if err := imp.Run(); err != nil {
-		return fmt.Errorf("re-importing %s: %w", storePath, err)
+		return fmt.Errorf("re-importing %s failed — the path was deleted; its export is kept at %s (restore with `nix-store --import < %s`): %w",
+			storePath, tmp.Name(), tmp.Name(), err)
 	}
+	imported = true
 	return nil
 }
