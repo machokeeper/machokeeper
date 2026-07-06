@@ -57,6 +57,9 @@ jobs:
             go test ./engine/ -run '^$' -fuzz="^$t$" -fuzztime=60s
           done
 
+  # nix flake check carries the full local gate: package build, tests +
+  # oracle, gofmt, vet, golangci-lint, gitleaks secrets scan, actionlint,
+  # and statix/deadnix nix hygiene — the same command a developer runs.
   nix:
     runs-on: macos-latest
     steps:

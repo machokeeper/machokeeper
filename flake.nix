@@ -53,8 +53,103 @@
               go
               golangci-lint
               python3
+              gitleaks
+              actionlint
+              statix
+              deadnix
             ];
           };
+        }
+      );
+
+      # `nix flake check` is the one-command local gate: package build,
+      # unit tests + oracle, gofmt, vet, golangci-lint, secrets scan,
+      # workflow lint, and nix-file hygiene. CI runs the same command.
+      checks = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          src = self;
+          goEnv = ''
+            export HOME=$TMPDIR GOCACHE=$TMPDIR/gocache GOPATH=$TMPDIR/gopath GOPROXY=off GOFLAGS=-mod=mod
+          '';
+        in
+        {
+          package = self.packages.${system}.default;
+
+          tests =
+            pkgs.runCommand "go-tests"
+              {
+                nativeBuildInputs = [
+                  pkgs.go
+                  pkgs.python3
+                ];
+              }
+              ''
+                cp -r ${src} src && chmod -R +w src && cd src
+                ${goEnv}
+                export MACHOKEEPER_REQUIRE_ORACLE=1
+                go vet ./...
+                go test ./...
+                touch $out
+              '';
+
+          gofmt =
+            pkgs.runCommand "gofmt-check" { nativeBuildInputs = [ pkgs.go ]; }
+              ''
+                cd ${src}
+                ${goEnv}
+                unformatted=$(gofmt -l .)
+                if [ -n "$unformatted" ]; then
+                  echo "unformatted files:"; echo "$unformatted"; exit 1
+                fi
+                touch $out
+              '';
+
+          lint =
+            pkgs.runCommand "golangci-lint"
+              {
+                nativeBuildInputs = [
+                  pkgs.go
+                  pkgs.golangci-lint
+                ];
+              }
+              ''
+                cp -r ${src} src && chmod -R +w src && cd src
+                ${goEnv}
+                export GOLANGCI_LINT_CACHE=$TMPDIR/lintcache
+                golangci-lint run --timeout 5m
+                touch $out
+              '';
+
+          secrets =
+            pkgs.runCommand "gitleaks" { nativeBuildInputs = [ pkgs.gitleaks ]; }
+              ''
+                gitleaks detect --source ${src} --no-git --redact
+                touch $out
+              '';
+
+          actionlint =
+            pkgs.runCommand "actionlint" { nativeBuildInputs = [ pkgs.actionlint ]; }
+              ''
+                # No .git in the store copy: name the workflow files explicitly.
+                actionlint ${src}/.github/workflows/*.yml
+                touch $out
+              '';
+
+          nix-hygiene =
+            pkgs.runCommand "nix-hygiene"
+              {
+                nativeBuildInputs = [
+                  pkgs.statix
+                  pkgs.deadnix
+                ];
+              }
+              ''
+                statix check ${src}
+                deadnix --fail ${src}
+                touch $out
+              '';
         }
       );
 
