@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/machokeeper/machokeeper/engine"
+	"github.com/machokeeper/machokeeper/internal/nixstore"
 )
 
 // A Finding is one broken (or unrepairable) signed Mach-O file.
@@ -143,69 +144,176 @@ func Run(args []string) int {
 		return 2
 	}
 
-	journalPath := fmt.Sprintf("machokeeper-undo-%d.json", time.Now().Unix())
-	var journal []journalEntry
-	fixed := 0
+	// Group repairable findings by the store path that contains them, so
+	// each store path is repaired on disk and then re-registered once.
+	// Files outside any store path are repaired standalone.
+	type group struct {
+		storePath string // "" for a non-store file
+		files     []*Finding
+	}
+	groups := map[string]*group{}
+	var order []string
 	for _, f := range findings {
 		if !f.Repairable {
 			continue
 		}
-		data, err := os.ReadFile(f.File)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "fix: %s: %v\n", f.File, err)
-			continue
+		key := f.File
+		sp, ok := nixstore.StorePathOf(f.File)
+		if ok {
+			key = sp
 		}
-		changes, modified, err := engine.Repair(data, f.File)
-		if err != nil || !modified {
-			fmt.Fprintf(os.Stderr, "fix: %s: %v\n", f.File, err)
-			continue
+		g := groups[key]
+		if g == nil {
+			g = &group{storePath: ""}
+			if ok {
+				g.storePath = sp
+			}
+			groups[key] = g
+			order = append(order, key)
 		}
-		// Never trust our own repair: re-verify before writing.
-		if engine.Check(data, f.File) {
-			fmt.Fprintf(os.Stderr, "fix: %s: still fails verification after repair; not writing\n", f.File)
-			continue
-		}
-		st, err := os.Stat(f.File)
-		if err != nil {
-			continue
-		}
-		if err := writeInPlace(f.File, data, st); err != nil {
-			fmt.Fprintf(os.Stderr, "fix: %s: %v (root needed for store paths?)\n", f.File, err)
-			continue
-		}
-		journal = append(journal, journalEntry{File: f.File, Time: time.Now(), Changes: changes})
-		fmt.Printf("REPAIRED  %s  (%d slot(s))\n", f.File, len(changes))
-		fixed++
+		g.files = append(g.files, f)
 	}
+
+	journalPath := fmt.Sprintf("machokeeper-undo-%d.json", time.Now().Unix())
+	var journal []journalEntry
+	fixed := 0
+
+	for _, key := range order {
+		g := groups[key]
+
+		// A rooted or referenced store path cannot be deleted, so it
+		// cannot be re-registered via export/delete/import. Repairing
+		// its bytes in place would leave the database NAR hash stale
+		// (and `nix store verify --repair` would then regress it to the
+		// broken cached copy). Refuse here; that case is the job of the
+		// forthcoming `--fix-live`.
+		if g.storePath != "" {
+			blockers, err := storePathBlockers(g.storePath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "fix: %s: %v\n", g.storePath, err)
+				continue
+			}
+			if len(blockers) > 0 {
+				fmt.Printf("SKIP    %s: in use (%s%s); repairing it in place would leave its recorded hash stale.\n",
+					g.storePath, blockers[0], more(blockers))
+				fmt.Println("        Rebuild it, or wait for `--fix-live` for GC-rooted paths (e.g. a login shell).")
+				continue
+			}
+		}
+
+		// Repair every broken file in the group on disk, hardlink-safely.
+		var groupChanges []journalEntry
+		ok := true
+		for _, f := range g.files {
+			changes, err := repairFileHardlinkSafe(f.File)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "fix: %s: %v\n", f.File, err)
+				ok = false
+				break
+			}
+			groupChanges = append(groupChanges, journalEntry{File: f.File, Time: time.Now(), Changes: changes})
+			fmt.Printf("REPAIRED  %s  (%d slot(s))\n", f.File, len(changes))
+		}
+		if !ok {
+			continue
+		}
+
+		// Re-register a store path so the database hash matches the
+		// repaired bytes. Non-store files are done after the on-disk
+		// write.
+		if g.storePath != "" {
+			if err := nixstore.Reregister(g.storePath); err != nil {
+				fmt.Fprintf(os.Stderr, "fix: %s: %v\n", g.storePath, err)
+				fmt.Fprintf(os.Stderr, "      (files were repaired on disk but the recorded hash is now stale; `nix store verify` will report it)\n")
+				continue
+			}
+			fmt.Printf("re-registered %s\n", g.storePath)
+		}
+		journal = append(journal, groupChanges...)
+		fixed += len(groupChanges)
+	}
+
 	if len(journal) > 0 {
 		if j, err := json.MarshalIndent(journal, "", " "); err == nil {
 			_ = os.WriteFile(journalPath, j, 0o644)
 			fmt.Printf("\nundo journal: %s\n", journalPath)
 		}
 	}
-	fmt.Printf("repaired %d of %d repairable file(s)\n", fixed, repairable)
+	fmt.Printf("repaired %d file(s)\n", fixed)
 	if fixed < repairable {
 		return 1
 	}
 	return 0
 }
 
-// writeInPlace writes repaired bytes preserving mode. Store files are
-// read-only; add owner-write transiently and restore.
-//
-// NOTE (M2): direct in-place writing is only safe for non-optimised,
-// non-shared files. The store-path-aware fix path (export → repair →
-// import, hardlink-safe) lands with the nix integration; this is the
-// plain-file path used for files outside the store and for tests.
-func writeInPlace(path string, data []byte, st os.FileInfo) error {
-	mode := st.Mode()
-	if mode&0o200 == 0 {
-		if err := os.Chmod(path, mode|0o200); err != nil {
-			return err
-		}
-		defer os.Chmod(path, mode)
+func more(blockers []string) string {
+	if len(blockers) > 1 {
+		return fmt.Sprintf(" and %d more", len(blockers)-1)
 	}
-	return os.WriteFile(path, data, mode)
+	return ""
+}
+
+// storePathBlockers returns GC roots and referrers that prevent deleting
+// (and thus re-registering) a store path.
+func storePathBlockers(storePath string) ([]string, error) {
+	roots, err := nixstore.Roots(storePath)
+	if err != nil {
+		return nil, err
+	}
+	refs, err := nixstore.Referrers(storePath)
+	if err != nil {
+		return nil, err
+	}
+	return append(roots, refs...), nil
+}
+
+// repairFileHardlinkSafe repairs one signed Mach-O file. It writes the
+// repaired bytes to a sibling temp file and renames it over the
+// original, so a file shared by `auto-optimise-store` hardlinks is not
+// corrupted through those other names — only this directory entry is
+// repointed at a fresh inode. The repair is re-verified before the
+// rename; only stale hash slots are ever changed.
+func repairFileHardlinkSafe(path string) ([]engine.Change, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	changes, modified, err := engine.Repair(data, path)
+	if err != nil {
+		return nil, err
+	}
+	if !modified {
+		return nil, fmt.Errorf("nothing to repair")
+	}
+	// Never trust our own repair: re-verify before writing.
+	if engine.Check(data, path) {
+		return nil, fmt.Errorf("still fails verification after repair; not writing")
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".machokeeper-*")
+	if err != nil {
+		return nil, err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(tmpName, st.Mode()); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return nil, err
+	}
+	return changes, nil
 }
 
 // Check implements `machokeeper check`: exit 0 all valid, 2 stale or
