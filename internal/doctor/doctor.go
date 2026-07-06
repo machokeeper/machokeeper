@@ -96,6 +96,7 @@ func Run(args []string) int {
 	fix := false
 	fixLive := false
 	scan := false
+	quiet := false
 	var paths []string
 	for _, a := range args {
 		switch a {
@@ -106,6 +107,8 @@ func Run(args []string) int {
 			fixLive = true
 		case "--scan":
 			scan = true
+		case "--quiet":
+			quiet = true
 		default:
 			paths = append(paths, a)
 		}
@@ -118,6 +121,12 @@ func Run(args []string) int {
 		return 1
 	}
 
+	say := func(format string, a ...any) {
+		if !quiet {
+			fmt.Printf(format, a...)
+		}
+	}
+
 	var findings []*Finding
 	for _, p := range paths {
 		if err := walk(p, func(f *Finding) { findings = append(findings, f) }); err != nil {
@@ -126,7 +135,7 @@ func Run(args []string) int {
 	}
 
 	if len(findings) == 0 {
-		fmt.Println("no broken Mach-O signatures found (of the ad-hoc/page-hash class)")
+		say("no broken Mach-O signatures found (of the ad-hoc/page-hash class)\n")
 		return 0
 	}
 
@@ -137,13 +146,13 @@ func Run(args []string) int {
 			status = "repairable"
 			repairable++
 		}
-		fmt.Printf("BROKEN  %s  [%s]\n", f.File, status)
+		say("BROKEN  %s  [%s]\n", f.File, status)
 	}
-	fmt.Printf("\n%d broken file(s); %d repairable\n", len(findings), repairable)
+	say("\n%d broken file(s); %d repairable\n", len(findings), repairable)
 
 	if !fix {
 		if repairable > 0 {
-			fmt.Println("run again with --fix to repair (writes an undo journal)")
+			say("run again with --fix to repair (writes an undo journal)\n")
 		}
 		return 2
 	}
@@ -178,7 +187,7 @@ func Run(args []string) int {
 		g.files = append(g.files, f)
 	}
 
-	journalPath := fmt.Sprintf("machokeeper-undo-%d.json", time.Now().Unix())
+	journalPath := journalFile()
 	var journal []journalEntry
 	fixed := 0
 
@@ -200,9 +209,9 @@ func Run(args []string) int {
 				continue
 			}
 			if len(blockers) > 0 {
-				fmt.Printf("SKIP    %s: in use (%s%s); repairing it in place would leave its recorded hash stale.\n",
+				say("SKIP    %s: in use (%s%s); repairing it in place would leave its recorded hash stale.\n",
 					g.storePath, blockers[0], more(blockers))
-				fmt.Println("        Re-run with --fix-live to repair a GC-rooted path (e.g. a login shell) and reconcile its hash.")
+				say("        Re-run with --fix-live to repair a GC-rooted path (e.g. a login shell) and reconcile its hash.\n")
 				continue
 			}
 		}
@@ -218,7 +227,7 @@ func Run(args []string) int {
 				break
 			}
 			groupChanges = append(groupChanges, journalEntry{File: f.File, Time: time.Now(), Changes: changes})
-			fmt.Printf("REPAIRED  %s  (%d slot(s))\n", f.File, len(changes))
+			say("REPAIRED  %s  (%d slot(s))\n", f.File, len(changes))
 		}
 		if !ok {
 			continue
@@ -240,7 +249,7 @@ func Run(args []string) int {
 				fmt.Fprintf(os.Stderr, "      (files were repaired on disk but the recorded hash is now stale; `nix store verify` will report it)\n")
 				continue
 			}
-			fmt.Printf("re-registered %s\n", g.storePath)
+			say("re-registered %s\n", g.storePath)
 		}
 		journal = append(journal, groupChanges...)
 		fixed += len(groupChanges)
@@ -249,14 +258,30 @@ func Run(args []string) int {
 	if len(journal) > 0 {
 		if j, err := json.MarshalIndent(journal, "", " "); err == nil {
 			_ = os.WriteFile(journalPath, j, 0o644)
-			fmt.Printf("\nundo journal: %s\n", journalPath)
+			say("\nundo journal: %s\n", journalPath)
 		}
 	}
-	fmt.Printf("repaired %d file(s)\n", fixed)
+	say("repaired %d file(s)\n", fixed)
 	if fixed < repairable {
 		return 1
 	}
 	return 0
+}
+
+// journalFile returns a writable path for the undo journal: a
+// timestamped file under /nix/var/machokeeper when writable (the module
+// runs there), else the current directory (interactive doctor use).
+func journalFile() string {
+	name := fmt.Sprintf("machokeeper-undo-%d.json", time.Now().Unix())
+	dir := "/nix/var/machokeeper"
+	if err := os.MkdirAll(dir, 0o755); err == nil {
+		if f, err := os.CreateTemp(dir, ".probe-"); err == nil {
+			f.Close()
+			os.Remove(f.Name())
+			return filepath.Join(dir, name)
+		}
+	}
+	return name
 }
 
 func more(blockers []string) string {

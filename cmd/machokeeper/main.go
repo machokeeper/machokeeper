@@ -10,6 +10,7 @@ import (
 	"os"
 
 	"github.com/machokeeper/machokeeper/internal/doctor"
+	"github.com/machokeeper/machokeeper/internal/hook"
 )
 
 const usage = `machokeeper — keep your Nix store's Mach-O binaries valid
@@ -38,6 +39,35 @@ func main() {
 		os.Exit(doctor.Run(os.Args[2:]))
 	case "check":
 		os.Exit(doctor.Check(os.Args[2:]))
+	// Module-driven, non-interactive entry points (see the nix-darwin /
+	// NixOS / home-manager module). All fail open.
+	case "post-build-hook":
+		os.Exit(hook.PostBuild())
+	case "scan-generation":
+		// scan-generation <new> [<old>] [--refuse]
+		var newP, oldP, mode string
+		mode = "repair"
+		var rest []string
+		for _, a := range os.Args[2:] {
+			if a == "--refuse" {
+				mode = "refuse"
+			} else {
+				rest = append(rest, a)
+			}
+		}
+		if len(rest) > 0 {
+			newP = rest[0]
+		}
+		if len(rest) > 1 {
+			oldP = rest[1]
+		}
+		if newP == "" {
+			fmt.Fprintln(os.Stderr, "scan-generation: need the new generation path")
+			os.Exit(1)
+		}
+		os.Exit(hook.ScanGeneration(newP, oldP, mode))
+	case "sweep":
+		os.Exit(hook.Sweep())
 	case "help", "--help", "-h":
 		fmt.Println(usage)
 	default:

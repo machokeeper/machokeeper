@@ -46,5 +46,26 @@
           meta.description = "Diagnose and repair broken Mach-O signatures in a Nix store";
         };
       });
+
+      darwinModules.default =
+        { config, lib, pkgs, ... }:
+        import ./nix/module-common.nix {
+          inherit config lib pkgs self;
+          platform = "darwin";
+        };
+
+      nixosModules.default =
+        { config, lib, pkgs, ... }:
+        import ./nix/module-common.nix {
+          inherit config lib pkgs self;
+          platform = "nixos";
+        };
+
+      homeManagerModules.default =
+        { config, lib, pkgs, ... }:
+        import ./nix/module-common.nix {
+          inherit config lib pkgs self;
+          platform = "home";
+        };
     };
 }
