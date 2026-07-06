@@ -26,6 +26,9 @@ jobs:
       - run: go vet ./...
       - name: Tests with race detector (includes oracle cross-validation)
         run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+        env:
+          # The oracle leg must run in CI, never silently skip.
+          MACHOKEEPER_REQUIRE_ORACLE: "1"
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
       - run: go build ./...
@@ -39,7 +42,7 @@ jobs:
           go-version: "1.23"
       - uses: golangci/golangci-lint-action@55c2c1448f86e01eaae002a5a3a9624417608d84 # v6
         with:
-          version: latest
+          version: v1.64.8
 
   fuzz:
     runs-on: ubuntu-latest

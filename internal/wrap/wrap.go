@@ -20,6 +20,17 @@ import (
 	"github.com/machokeeper/machokeeper/internal/doctor"
 )
 
+// Injectable seams so the orchestration (pre-fetch, run, repair-sweep,
+// retry-once) is testable without nix or a store.
+var (
+	willSubstituteFn = willSubstitute
+	realiseFn        = realise
+	passthroughFn    = passthrough
+	fixFn            = func(paths []string) int {
+		return doctor.Run(append([]string{"--fix", "--quiet"}, paths...))
+	}
+)
+
 // Run implements `machokeeper wrap -- <argv...>`. argv is the nix
 // command to run (e.g. ["nix" "build" ".#foo"]).
 func Run(argv []string) int {
@@ -30,14 +41,14 @@ func Run(argv []string) int {
 
 	// Pre-fetch pass: ask nix what it would substitute, realise and
 	// repair those paths before the real run uses them.
-	if subs := willSubstitute(argv); len(subs) > 0 {
-		if realised := realise(subs); len(realised) > 0 {
-			doctor.Run(append([]string{"--fix", "--quiet"}, realised...))
+	if subs := willSubstituteFn(argv); len(subs) > 0 {
+		if realised := realiseFn(subs); len(realised) > 0 {
+			fixFn(realised)
 		}
 	}
 
 	// Run the real command.
-	rc := passthrough(argv)
+	rc := passthroughFn(argv)
 	if rc == 0 {
 		return 0
 	}
@@ -45,9 +56,9 @@ func Run(argv []string) int {
 	// It failed. A common cause is a binary that was substituted and
 	// used within the run before the pre-fetch could reach it (IFD, an
 	// impure path, a dependency pulled mid-build). Repair everything the
-	// command's derivations reference, then retry once.
-	if repaired := repairClosureOf(argv); repaired {
-		return passthrough(argv)
+	// dry run now reports, then retry once.
+	if repaired := repairSubstitutes(argv); repaired {
+		return passthroughFn(argv)
 	}
 	return rc
 }
@@ -153,18 +164,18 @@ func realise(paths []string) []string {
 	return ok
 }
 
-// repairClosureOf realises and repairs the full closure of whatever the
-// command references, as a fallback after a failed run. Returns true if
-// it repaired anything.
-func repairClosureOf(argv []string) bool {
-	// Re-run the dry list; if empty, nothing to do.
-	subs := willSubstitute(argv)
-	realised := realise(subs)
+// repairSubstitutes re-runs the dry-run substitute query — after a
+// failed run it can name paths the pre-fetch didn't see (IFD, impure
+// evaluation) — realises them, and repairs them. Returns true if a
+// repair sweep ran clean and a retry is worthwhile. Best-effort like
+// the pre-fetch: paths already local before the run are not revisited.
+func repairSubstitutes(argv []string) bool {
+	subs := willSubstituteFn(argv)
+	realised := realiseFn(subs)
 	if len(realised) == 0 {
 		return false
 	}
-	rc := doctor.Run(append([]string{"--fix", "--quiet"}, realised...))
-	return rc == 0
+	return fixFn(realised) == 0
 }
 
 func passthrough(argv []string) int {
