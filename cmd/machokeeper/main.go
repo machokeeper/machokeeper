@@ -11,6 +11,7 @@ import (
 
 	"github.com/machokeeper/machokeeper/internal/doctor"
 	"github.com/machokeeper/machokeeper/internal/hook"
+	"github.com/machokeeper/machokeeper/internal/wrap"
 )
 
 const usage = `machokeeper — keep your Nix store's Mach-O binaries valid
@@ -20,6 +21,7 @@ Usage:
   machokeeper doctor --scan [--fix]    scan the whole local Nix store
   machokeeper doctor --fix-live PATH   also repair GC-rooted paths (e.g. a login shell) in place
   machokeeper check PATH...            exit 2 if any signature is stale or unverifiable
+  machokeeper wrap -- nix build ...    run a nix command, repairing what it substitutes first
   machokeeper help
 
 Without --fix, doctor only reports. --fix repairs unrooted store paths
@@ -68,6 +70,13 @@ func main() {
 		os.Exit(hook.ScanGeneration(newP, oldP, mode))
 	case "sweep":
 		os.Exit(hook.Sweep())
+	case "wrap":
+		// machokeeper wrap -- nix build ...
+		rest := os.Args[2:]
+		if len(rest) > 0 && rest[0] == "--" {
+			rest = rest[1:]
+		}
+		os.Exit(wrap.Run(rest))
 	case "help", "--help", "-h":
 		fmt.Println(usage)
 	default:

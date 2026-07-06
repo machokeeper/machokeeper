@@ -35,15 +35,53 @@ A signature the engine cannot verify (unsupported hash type, malformed CodeDirec
 
 The engine is a port of the repair validated on the [NixOS/nix#15638](https://github.com/NixOS/nix/pull/15638) branch: unit-tested against hand-built byte fixtures, mutation-fuzzed, and cross-validated in CI against an independent from-scratch Python verifier that shares no code with it. The original was verified 10/10 against real broken cache.nixos.org binaries spanning every failing signature class (thin, fat32/fat64, dual SHA-1+SHA-256 CodeDirectories, 56-slot Bun single-file executables).
 
-## What it cannot fix
+## Repairing store paths
 
-Content-addressed cold-build corruption (NixOS/nix#6065) and the spurious `--check` nondeterminism failure on signed binaries happen inside Nix at build time; no external tool can reach them. They are detected and named, and remain upstream work.
+`doctor --fix` repairs a registered store path safely. It writes each repaired file to a sibling temp and renames it into place, so a file that `auto-optimise-store` hardlinks across paths is not corrupted through its other names, and it re-registers the path with `nix-store --export | --delete | --import` so the database NAR hash matches the repaired bytes (the path keeps its name — input-addressed paths do not depend on their contents). Repair may need `sudo` on a multi-user install; doctor prints the operations before it runs them.
 
-## Roadmap
+A path that is a GC root or referenced by another path (a live login shell) cannot be deleted, so `--fix` refuses it. `doctor --fix-live` repairs such a path in place and reconciles its recorded hash directly (no delete). Use it when your shell itself is broken.
 
-- `doctor --fix` for registered store paths via `nix-store --export`/`--import` (hardlink-safe, DB-consistent)
-- nix-darwin / NixOS / home-manager module: `post-build-hook` + activation-time scan of new generations
-- `machokeeper wrap` for ad-hoc `nix build`/`shell`/`run`
+## Continuous protection (module)
+
+For nix-darwin, NixOS, or home-manager, enable the module and every door bytes enter your store by is guarded — no daemon, no timer:
+
+```nix
+{
+  inputs.machokeeper.url = "github:machokeeper/machokeeper";
+
+  # nix-darwin:
+  imports = [ inputs.machokeeper.darwinModules.default ];
+  services.machokeeper.enable = true;
+}
+```
+
+- **`post-build-hook`** repairs locally built outputs before first use (the partial-store rewrite trigger). It chains any hook you already have — set `services.machokeeper.chainPostBuildHook = <your prior hook>;` (nix allows only one).
+- **Activation scan** repairs the new generation's store paths during `darwin-rebuild switch` / `nixos-rebuild switch`, after substitution and before the generation goes live — so a broken `fish` never becomes your login shell. Set `services.machokeeper.onActivation = "refuse";` to fail the switch instead of repairing.
+- **First-enable sweep** repairs anything already broken in the store, once.
+
+## Ad-hoc commands (wrap)
+
+For `nix build`/`shell`/`run` that both substitute and use a binary in one invocation (like `direnv`'s check phase running a just-fetched `fish`):
+
+```console
+$ machokeeper wrap -- nix build .#something
+```
+
+It dry-runs the command, repairs what would be substituted, then runs the command unmodified; a failed run is retried once after repairing what it pulled. No proxy, no signing keys, no `trusted-users` change.
+
+## Coverage
+
+| Case | machokeeper |
+|---|---|
+| Broken binaries substituted from cache (fish, and the [~440 tracked slices](https://github.com/ak2k/nix-507531-scope)) | repair — `doctor`, wrap, activation scan |
+| Builds failing on a broken substituted dependency (direnv's `fish` check phase) | fixed — the dependency is repaired first |
+| Already-broken store, including a rooted login shell | repair — `doctor --fix` / `--fix-live` |
+| Local build rewrite damage (partial store state) | repair — `post-build-hook`, before first use |
+| Developer-ID / App Store signatures | detected, never touched (signer-only) |
+| Content-addressed cold-build corruption ([#6065](https://github.com/NixOS/nix/issues/6065)) | detected only — no consistent repair exists |
+| `--check` / `--rebuild` spurious nondeterminism | not reachable — happens inside Nix at build time |
+
+The last two are inside Nix and remain upstream work; everything else machokeeper detects, and repairs where a repair exists.
 
 ## License
 
