@@ -9,6 +9,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
+	"sync"
 	"time"
 
 	"github.com/machokeeper/machokeeper/engine"
@@ -111,12 +114,72 @@ func walk(root string, visit func(*Finding)) error {
 	})
 }
 
+// walkParallel is walk with the per-file scan fanned out over a worker
+// pool: a whole-store scan is dominated by reading and hashing file
+// contents, which parallelises cleanly. Directory traversal stays
+// single-threaded; findings are delivered from a single goroutine, so
+// the visit callback needs no locking.
+func walkParallel(root string, visit func(*Finding)) error {
+	workers := runtime.NumCPU()
+	files := make(chan string, workers*4)
+	results := make(chan *Finding, workers)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := range files {
+				if f := scanFile(p); f != nil {
+					results <- f
+				}
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var walkErr error
+	go func() {
+		defer close(files)
+		info, err := os.Lstat(root)
+		if err != nil {
+			walkErr = err
+			return
+		}
+		if info.Mode().IsRegular() {
+			files <- root
+			return
+		}
+		if !info.IsDir() {
+			return
+		}
+		_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return nil // skip unreadable entries, keep walking
+			}
+			if d.Type().IsRegular() {
+				files <- p
+			}
+			return nil
+		})
+	}()
+
+	for f := range results {
+		visit(f)
+	}
+	return walkErr
+}
+
 // Run implements `machokeeper doctor`.
 func Run(args []string) int {
 	fix := false
 	fixLive := false
 	scan := false
 	quiet := false
+	jsonOut := false
 	var paths []string
 	for _, a := range args {
 		switch a {
@@ -128,6 +191,9 @@ func Run(args []string) int {
 		case "--scan":
 			scan = true
 		case "--quiet":
+			quiet = true
+		case "--json":
+			jsonOut = true
 			quiet = true
 		default:
 			paths = append(paths, a)
@@ -149,9 +215,19 @@ func Run(args []string) int {
 
 	var findings []*Finding
 	for _, p := range paths {
-		if err := walk(p, func(f *Finding) { findings = append(findings, f) }); err != nil {
+		if err := walkParallel(p, func(f *Finding) { findings = append(findings, f) }); err != nil {
 			fmt.Fprintf(os.Stderr, "doctor: %s: %v\n", p, err)
 		}
+	}
+	sort.Slice(findings, func(i, j int) bool { return findings[i].File < findings[j].File })
+
+	if jsonOut && !fix {
+		out, _ := json.MarshalIndent(findings, "", "  ")
+		fmt.Println(string(out))
+		if len(findings) == 0 {
+			return 0
+		}
+		return 2
 	}
 
 	if len(findings) == 0 {

@@ -20,8 +20,10 @@ Usage:
   machokeeper doctor [--fix] PATH...   diagnose (and with --fix, repair) files or store paths
   machokeeper doctor --scan [--fix]    scan the whole local Nix store
   machokeeper doctor --fix-live PATH   also repair GC-rooted paths (e.g. a login shell) in place
+  machokeeper doctor --scan --json     machine-readable findings (implies report-only)
   machokeeper check PATH...            exit 2 if any signature is stale or unverifiable
   machokeeper wrap -- nix build ...    run a nix command, repairing what it substitutes first
+  machokeeper version
   machokeeper help
 
 Without --fix, doctor only reports. --fix repairs unrooted store paths

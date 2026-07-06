@@ -11,6 +11,7 @@
 package wrap
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -62,22 +63,74 @@ func willSubstitute(argv []string) []string {
 	return parseSubstitutePaths(string(out))
 }
 
-// parseSubstitutePaths extracts the store paths a substitution log
-// mentions. internal-json substitution events name the path in a
-// "copying path" / "substituting" message; a robust-enough heuristic
-// without a full JSON schema is to take any /nix/store/… token on such
-// a line. Lines that merely name a .drv being built are ignored (they
-// contain neither marker).
+// nixLogEvent is the subset of nix's internal-json log schema wrap
+// needs. Two event shapes carry substitution paths:
+//
+//   - a dry run prints plain messages, "this path will be fetched"
+//     followed by indented store paths (action "msg");
+//   - a live run starts a copy-path activity (action "start", type
+//     100) whose first field is the store path, and substitution
+//     queries (type 109) name the path the same way.
+//
+// internal-json is not a stable interface, so unknown shapes are
+// ignored and wrap stays best-effort by design.
+type nixLogEvent struct {
+	Action string            `json:"action"`
+	Type   int               `json:"type"`
+	Msg    string            `json:"msg"`
+	Text   string            `json:"text"`
+	Fields []json.RawMessage `json:"fields"`
+}
+
+const (
+	actCopyPath   = 100
+	actSubstitute = 109
+)
+
+// parseSubstitutePaths extracts the store paths a nix internal-json log
+// says will be (or are being) substituted.
 func parseSubstitutePaths(log string) []string {
 	var subs []string
+	inFetchList := false
 	for _, line := range strings.Split(log, "\n") {
-		if !strings.Contains(line, "substitut") && !strings.Contains(line, "copying path") {
+		raw, ok := strings.CutPrefix(line, "@nix ")
+		if !ok {
 			continue
 		}
-		for _, tok := range strings.Fields(strings.ReplaceAll(line, "\"", " ")) {
-			tok = strings.Trim(tok, "'")
-			if strings.HasPrefix(tok, "/nix/store/") {
-				subs = append(subs, cleanPath(tok))
+		var ev nixLogEvent
+		if err := json.Unmarshal([]byte(raw), &ev); err != nil {
+			continue
+		}
+		switch ev.Action {
+		case "msg":
+			// Dry-run: "these N paths will be fetched…" then one
+			// indented store path per message.
+			m := strings.TrimRight(ev.Msg, ":")
+			if strings.Contains(m, "will be fetched") {
+				inFetchList = true
+				continue
+			}
+			trimmed := strings.TrimSpace(ev.Msg)
+			if inFetchList && strings.HasPrefix(trimmed, "/nix/store/") {
+				subs = append(subs, cleanPath(trimmed))
+				continue
+			}
+			if trimmed != "" && !strings.HasPrefix(trimmed, "/nix/store/") {
+				inFetchList = false
+			}
+		case "start":
+			if ev.Type != actCopyPath && ev.Type != actSubstitute {
+				continue
+			}
+			if len(ev.Fields) == 0 {
+				continue
+			}
+			var p string
+			if err := json.Unmarshal(ev.Fields[0], &p); err != nil {
+				continue
+			}
+			if strings.HasPrefix(p, "/nix/store/") {
+				subs = append(subs, cleanPath(p))
 			}
 		}
 	}

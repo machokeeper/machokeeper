@@ -298,3 +298,39 @@ func assertJournalUndoes(t *testing.T, dir, repaired string) {
 		t.Error("undo journal did not restore the original (stale) bytes")
 	}
 }
+
+func TestWalkParallelFindsAllBroken(t *testing.T) {
+	withStore(t, &fakeStore{})
+	dir := t.TempDir()
+	// A tree of many broken files plus decoys the scan must ignore.
+	const nBroken = 40
+	for i := 0; i < nBroken; i++ {
+		sub := filepath.Join(dir, "d", string(rune('a'+i%20)))
+		os.MkdirAll(sub, 0o755)
+		os.WriteFile(filepath.Join(sub, fmtInt(i)+".dylib"), machofixture.Repairable(2), 0o644)
+	}
+	os.WriteFile(filepath.Join(dir, "not-macho"), []byte("hello world not a binary"), 0o644)
+	valid := machofixture.Repairable(2)
+	engine.Repair(valid, "x")
+	os.WriteFile(filepath.Join(dir, "valid.dylib"), valid, 0o644)
+
+	var count int
+	if err := walkParallel(dir, func(*Finding) { count++ }); err != nil {
+		t.Fatal(err)
+	}
+	if count != nBroken {
+		t.Errorf("walkParallel found %d broken, want %d", count, nBroken)
+	}
+}
+
+func fmtInt(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var b []byte
+	for i > 0 {
+		b = append([]byte{byte('0' + i%10)}, b...)
+		i /= 10
+	}
+	return string(b)
+}
