@@ -73,14 +73,14 @@ func Sweep() int {
 // in oldPath's closure. With no oldPath it returns newPath's whole
 // closure.
 func closureDelta(newPath, oldPath string) ([]string, error) {
-	newClosure, err := requisites(newPath)
+	newClosure, err := requisitesFn(newPath)
 	if err != nil {
 		return nil, err
 	}
 	if oldPath == "" {
 		return newClosure, nil
 	}
-	oldClosure, err := requisites(oldPath)
+	oldClosure, err := requisitesFn(oldPath)
 	if err != nil {
 		// If the old generation is gone, scan the whole new closure.
 		return newClosure, nil
@@ -97,6 +97,9 @@ func closureDelta(newPath, oldPath string) ([]string, error) {
 	}
 	return delta, nil
 }
+
+// requisitesFn is the closure query, injectable for tests.
+var requisitesFn = requisites
 
 func requisites(path string) ([]string, error) {
 	out, err := exec.Command("nix-store", "--query", "--requisites", path).Output()

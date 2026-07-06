@@ -18,9 +18,44 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23"
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; echo 'run gofmt -w .'; exit 1; }
       - run: go vet ./...
-      - name: Tests (includes oracle cross-validation)
-        run: go test ./...
-      - name: Race detector
-        run: go test -race ./engine/
+      - name: Tests with race detector (includes oracle cross-validation)
+        run: go test -race ./...
       - run: go build ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Fuzz the parser (bounded)
+        run: |
+          for t in FuzzDetect FuzzCheck FuzzRepair; do
+            go test ./engine/ -run '^$' -fuzz="^$t$" -fuzztime=60s
+          done
+
+  nix:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: "experimental-features = nix-command flakes"
+      - run: nix flake check
+      - run: nix build .#default
+      - run: ./result/bin/machokeeper help

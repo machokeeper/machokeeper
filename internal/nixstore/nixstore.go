@@ -149,8 +149,8 @@ func Reregister(storePath string) error {
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmp.Name())
-	defer tmp.Close()
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	defer func() { _ = tmp.Close() }()
 
 	// export: streams the NAR from disk (repaired contents) plus the
 	// path's metadata; the NAR hash is recomputed on import.

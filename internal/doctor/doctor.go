@@ -15,6 +15,26 @@ import (
 	"github.com/machokeeper/machokeeper/internal/nixstore"
 )
 
+// storeBackend is the set of Nix store operations repair needs. It is
+// an interface so tests can drive the full fix / fix-live flow without a
+// live daemon; the default implementation calls internal/nixstore.
+type storeBackend interface {
+	StorePathOf(file string) (string, bool)
+	Blockers(storePath string) ([]string, error)
+	Reregister(storePath string) error
+	ReconcileHash(storePath string) error
+}
+
+type realStore struct{}
+
+func (realStore) StorePathOf(f string) (string, bool) { return nixstore.StorePathOf(f) }
+func (realStore) Reregister(p string) error           { return nixstore.Reregister(p) }
+func (realStore) Blockers(p string) ([]string, error) { return storePathBlockers(p) }
+func (realStore) ReconcileHash(p string) error        { return reconcileHash(p) }
+
+// store is the backend used by Run; tests replace it.
+var store storeBackend = realStore{}
+
 // A Finding is one broken (or unrepairable) signed Mach-O file.
 type Finding struct {
 	File string      `json:"file"`
@@ -39,7 +59,7 @@ func scanFile(path string) *Finding {
 	if err != nil {
 		return nil
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	peek := make([]byte, 4)
 	if n, _ := f.Read(peek); n < 4 || !engine.HasMachOMagic(peek) {
 		return nil
@@ -171,7 +191,7 @@ func Run(args []string) int {
 			continue
 		}
 		key := f.File
-		sp, ok := nixstore.StorePathOf(f.File)
+		sp, ok := store.StorePathOf(f.File)
 		if ok {
 			key = sp
 		}
@@ -203,7 +223,7 @@ func Run(args []string) int {
 		// row directly (below).
 		reregister := g.storePath != ""
 		if g.storePath != "" && !fixLive {
-			blockers, err := storePathBlockers(g.storePath)
+			blockers, err := store.Blockers(g.storePath)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "fix: %s: %v\n", g.storePath, err)
 				continue
@@ -240,9 +260,9 @@ func Run(args []string) int {
 		if reregister {
 			var regErr error
 			if fixLive {
-				regErr = reconcileHash(g.storePath)
+				regErr = store.ReconcileHash(g.storePath)
 			} else {
-				regErr = nixstore.Reregister(g.storePath)
+				regErr = store.Reregister(g.storePath)
 			}
 			if regErr != nil {
 				fmt.Fprintf(os.Stderr, "fix: %s: %v\n", g.storePath, regErr)
@@ -257,13 +277,18 @@ func Run(args []string) int {
 
 	if len(journal) > 0 {
 		if j, err := json.MarshalIndent(journal, "", " "); err == nil {
-			_ = os.WriteFile(journalPath, j, 0o644)
+			_ = os.WriteFile(journalPath, j, 0o600)
 			say("\nundo journal: %s\n", journalPath)
 		}
 	}
 	say("repaired %d file(s)\n", fixed)
-	if fixed < repairable {
-		return 1
+	// Exit 0 only when nothing broken remains. If any broken file was
+	// not repaired — unrepairable (CMS/CA), a rooted path skipped
+	// without --fix-live, or a repair error — something in the store is
+	// still broken, so report exit 2, the same "stale" signal `check`
+	// and report-mode use.
+	if fixed < len(findings) {
+		return 2
 	}
 	return 0
 }
@@ -274,10 +299,10 @@ func Run(args []string) int {
 func journalFile() string {
 	name := fmt.Sprintf("machokeeper-undo-%d.json", time.Now().Unix())
 	dir := "/nix/var/machokeeper"
-	if err := os.MkdirAll(dir, 0o755); err == nil {
+	if err := os.MkdirAll(dir, 0o750); err == nil {
 		if f, err := os.CreateTemp(dir, ".probe-"); err == nil {
-			f.Close()
-			os.Remove(f.Name())
+			_ = f.Close()
+			_ = os.Remove(f.Name())
 			return filepath.Join(dir, name)
 		}
 	}
@@ -353,9 +378,9 @@ func repairFileHardlinkSafe(path string) ([]engine.Change, error) {
 		return nil, err
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op after a successful rename
+	defer func() { _ = os.Remove(tmpName) }() // no-op after a successful rename
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return nil, err
 	}
 	if err := tmp.Close(); err != nil {

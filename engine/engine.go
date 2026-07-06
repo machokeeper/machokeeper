@@ -21,7 +21,7 @@
 package engine
 
 import (
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // kernel validates SHA-1 CodeDirectories at page-in; we must recompute them
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"

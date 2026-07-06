@@ -1,0 +1,38 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gosec
+    - misspell
+    - unconvert
+    - bodyclose
+  settings:
+    gosec:
+      # This tool runs untrusted store bytes through the parser and execs
+      # nix-store; subprocess exec (G204), file reads by variable path
+      # (G304), and int<->uint32 conversions of Mach-O header fields
+      # (G115, whose bounds safety is covered by the engine fuzz targets)
+      # are the point of the program, reviewed by design.
+      excludes:
+        - G204
+        - G304
+        - G115
+    misspell:
+      ignore-rules:
+        - substituters # Nix's own term for binary-cache sources
+  exclusions:
+    rules:
+      # Tests: unchecked cleanup errors and 0644 fixture files are fine.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+
+formatters:
+  enable:
+    - gofmt

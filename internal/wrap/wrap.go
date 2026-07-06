@@ -59,16 +59,25 @@ func willSubstitute(argv []string) []string {
 	dry = append(dry, "--dry-run", "--log-format", "internal-json")
 	cmd := exec.Command(dry[0], dry[1:]...)
 	out, _ := cmd.CombinedOutput() // dry-run failures are non-fatal here
+	return parseSubstitutePaths(string(out))
+}
+
+// parseSubstitutePaths extracts the store paths a substitution log
+// mentions. internal-json substitution events name the path in a
+// "copying path" / "substituting" message; a robust-enough heuristic
+// without a full JSON schema is to take any /nix/store/… token on such
+// a line. Lines that merely name a .drv being built are ignored (they
+// contain neither marker).
+func parseSubstitutePaths(log string) []string {
 	var subs []string
-	for _, line := range strings.Split(string(out), "\n") {
-		// internal-json substitution events name the path in `fields`.
-		// A robust-enough heuristic without a full JSON schema: any
-		// /nix/store/… token on a "copying"/"substituting" line.
-		if strings.Contains(line, "substitut") || strings.Contains(line, "copying path") {
-			for _, tok := range strings.Fields(strings.ReplaceAll(line, "\"", " ")) {
-				if strings.HasPrefix(tok, "/nix/store/") {
-					subs = append(subs, cleanPath(tok))
-				}
+	for _, line := range strings.Split(log, "\n") {
+		if !strings.Contains(line, "substitut") && !strings.Contains(line, "copying path") {
+			continue
+		}
+		for _, tok := range strings.Fields(strings.ReplaceAll(line, "\"", " ")) {
+			tok = strings.Trim(tok, "'")
+			if strings.HasPrefix(tok, "/nix/store/") {
+				subs = append(subs, cleanPath(tok))
 			}
 		}
 	}
