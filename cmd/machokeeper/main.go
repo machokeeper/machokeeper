@@ -31,6 +31,9 @@ only stale hash slots (byte-exact undo journal written next to the
 report) and never touches Developer-ID-signed files or content-addressed
 paths.`
 
+// version is set at build time via -ldflags "-X main.version=<tag>".
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println(usage)
@@ -77,6 +80,8 @@ func main() {
 			rest = rest[1:]
 		}
 		os.Exit(wrap.Run(rest))
+	case "version", "--version":
+		fmt.Printf("machokeeper %s\n", version)
 	case "help", "--help", "-h":
 		fmt.Println(usage)
 	default:
