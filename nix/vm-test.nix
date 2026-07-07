@@ -52,11 +52,15 @@ pkgs.testers.runNixOSTest {
     # builder can use /bin/sh.
     def build_pkg(name, fixture, filename, out_link=None):
         link = f"-o {out_link}" if out_link else "--no-out-link"
+        # Raw `derivation`: no stdenv, so the builder gets no PATH —
+        # point it at coreutils explicitly (host store paths are visible
+        # through the VM's store share).
         expr = (
             "derivation { name = \"" + name + "\"; "
             "system = builtins.currentSystem; "
             "builder = \"/bin/sh\"; "
-            "args = [ \"-c\" \"mkdir -p $out/bin && "
+            "args = [ \"-c\" \""
+            "export PATH=${pkgs.coreutils}/bin && mkdir -p $out/bin && "
             "cp ${fixtures}/" + fixture + " $out/bin/" + filename + " && "
             "chmod +x $out/bin/" + filename + "\" ]; }"
         )
