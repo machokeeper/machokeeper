@@ -4,7 +4,9 @@ machokeeper detects and repairs stale Mach-O page-hash signatures in Nix
 stores. `engine/` is the repair math; everything else is plumbing around it.
 Read [CONTRIBUTING.md](CONTRIBUTING.md) (invariants, engine change rules) and
 [THREAT-MODEL.md](THREAT-MODEL.md) before touching `engine/` or anything that
-writes to a store.
+writes to a store. [docs/DESIGN.md](docs/DESIGN.md) has the "doors" model —
+which mechanism (post-build hook, activation scan, `wrap`, doctor/sweep)
+guards each way stale bytes enter a store, and why it's out-of-band.
 
 ## Commands
 
