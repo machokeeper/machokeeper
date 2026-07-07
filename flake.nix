@@ -1,10 +1,20 @@
 {
   description = "Keep your Nix store's Mach-O binaries valid";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      treefmt-nix,
+    }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [
         "aarch64-darwin"
@@ -12,8 +22,32 @@
         "aarch64-linux"
         "x86_64-linux"
       ];
+
+      # One formatter tree for every language in the repo: `nix fmt`
+      # writes, the treefmt flake check verifies. gofmt stays the Go
+      # authority (the same formatting CI's gofmt gate demands).
+      treefmtFor =
+        system:
+        treefmt-nix.lib.evalModule nixpkgs.legacyPackages.${system} {
+          projectRootFile = "flake.nix";
+          programs = {
+            gofmt.enable = true;
+            nixfmt.enable = true;
+            ruff-format.enable = true;
+            shfmt.enable = true;
+            yamlfmt = {
+              enable = true;
+              settings.formatter.retain_line_breaks_single = true;
+            };
+          };
+          # The vendored oracle stays byte-comparable with its C++-era
+          # ancestor; don't reformat it.
+          settings.global.excludes = [ "internal/oracle/*.py" ];
+        };
     in
     {
+      formatter = forAllSystems (system: (treefmtFor system).config.build.wrapper);
+
       packages = forAllSystems (
         system:
         let
@@ -63,8 +97,9 @@
       );
 
       # `nix flake check` is the one-command local gate: package build,
-      # unit tests + oracle, gofmt, vet, golangci-lint, secrets scan,
-      # workflow lint, and nix-file hygiene. CI runs the same command.
+      # whole-tree formatting (treefmt), unit tests + oracle, vet,
+      # golangci-lint, secrets scan, workflow lint, and nix-file
+      # hygiene. CI runs the same command.
       checks = forAllSystems (
         system:
         let
@@ -76,6 +111,9 @@
         in
         {
           package = self.packages.${system}.default;
+
+          # Whole-tree formatting (nix fmt to fix).
+          treefmt = (treefmtFor system).config.build.check self;
 
           tests =
             pkgs.runCommand "go-tests"
@@ -91,18 +129,6 @@
                 export MACHOKEEPER_REQUIRE_ORACLE=1
                 go vet ./...
                 go test ./...
-                touch $out
-              '';
-
-          gofmt =
-            pkgs.runCommand "gofmt-check" { nativeBuildInputs = [ pkgs.go ]; }
-              ''
-                cd ${src}
-                ${goEnv}
-                unformatted=$(gofmt -l .)
-                if [ -n "$unformatted" ]; then
-                  echo "unformatted files:"; echo "$unformatted"; exit 1
-                fi
                 touch $out
               '';
 
@@ -122,20 +148,16 @@
                 touch $out
               '';
 
-          secrets =
-            pkgs.runCommand "gitleaks" { nativeBuildInputs = [ pkgs.gitleaks ]; }
-              ''
-                gitleaks detect --source ${src} --no-git --redact
-                touch $out
-              '';
+          secrets = pkgs.runCommand "gitleaks" { nativeBuildInputs = [ pkgs.gitleaks ]; } ''
+            gitleaks detect --source ${src} --no-git --redact
+            touch $out
+          '';
 
-          actionlint =
-            pkgs.runCommand "actionlint" { nativeBuildInputs = [ pkgs.actionlint ]; }
-              ''
-                # No .git in the store copy: name the workflow files explicitly.
-                actionlint ${src}/.github/workflows/*.yml
-                touch $out
-              '';
+          actionlint = pkgs.runCommand "actionlint" { nativeBuildInputs = [ pkgs.actionlint ]; } ''
+            # No .git in the store copy: name the workflow files explicitly.
+            actionlint ${src}/.github/workflows/*.yml
+            touch $out
+          '';
 
           nix-hygiene =
             pkgs.runCommand "nix-hygiene"
@@ -162,23 +184,53 @@
       });
 
       darwinModules.default =
-        { config, lib, pkgs, ... }:
+        {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
         import ./nix/module-common.nix {
-          inherit config lib pkgs self;
+          inherit
+            config
+            lib
+            pkgs
+            self
+            ;
           platform = "darwin";
         };
 
       nixosModules.default =
-        { config, lib, pkgs, ... }:
+        {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
         import ./nix/module-common.nix {
-          inherit config lib pkgs self;
+          inherit
+            config
+            lib
+            pkgs
+            self
+            ;
           platform = "nixos";
         };
 
       homeManagerModules.default =
-        { config, lib, pkgs, ... }:
+        {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
         import ./nix/module-common.nix {
-          inherit config lib pkgs self;
+          inherit
+            config
+            lib
+            pkgs
+            self
+            ;
           platform = "home";
         };
     };

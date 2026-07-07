@@ -13,13 +13,13 @@ writes to a store.
 | `go build ./...` | fast; run after every edit |
 | `go test ./...` | unit + oracle cross-validation; ~seconds. **The oracle test skips silently without `python3` on PATH** — run inside `nix develop` or a green run proves less than it looks |
 | `go test -race ./...` | the authoritative test gate; slower, run before claiming done |
-| `gofmt -w .` | CI rejects unformatted code |
+| `nix fmt` | treefmt over the whole tree (gofmt, nixfmt, ruff, shfmt, yamlfmt); CI rejects unformatted code |
 | `go vet ./...` | part of CI |
 | `golangci-lint run` | lint gate (config `.golangci.yml`); in `nix develop` |
 | `nix flake check && nix build .#default` | package + module eval; run when touching `flake.nix`, `nix/`, or module hooks |
 | `go test -fuzz=FuzzDetect -fuzztime=30s ./engine/` | bounded fuzz spot-check (also FuzzCheck, FuzzRepair); CI runs these bounded |
 
-Pre-merge = `gofmt` clean + `go vet` + `go test -race ./...` +
+Pre-merge = `nix fmt` clean + `go vet` + `go test -race ./...` +
 `golangci-lint run`, plus the nix pair when nix files changed. All fresh,
 exit 0, this session — paste output, don't recall it.
 
