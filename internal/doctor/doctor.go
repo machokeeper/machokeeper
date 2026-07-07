@@ -368,81 +368,103 @@ func Run(args []string) int {
 	var journal []journalEntry
 	fixed := 0
 
-	for _, key := range order {
-		g := groups[key]
-
-		// A rooted or referenced store path is live — a login shell, a
-		// current system generation. Repairing something in use needs
-		// the operator's explicit consent: without --fix-live, refuse.
-		// (The hash reconciliation below works for rooted and unrooted
-		// paths alike; the distinction is consent, not mechanism.)
-		reconcile := g.storePath != ""
-
-		// A content-addressed path's name IS a function of its bytes:
-		// repairing it would break the content address. Refusal class
-		// (THREAT-MODEL); no --fix variant overrides it. A failed query
-		// also refuses — unknown must never be treated as repairable.
+	// The repair phase writes store files and reconciles their DB hash.
+	// Hold nix's GC lock shared for its duration when any store path is
+	// involved, so a concurrent `nix-store --gc` can't collect a path
+	// mid-repair — the same shared lock the daemon takes for its own
+	// store writes. Plain-file repairs (no store path) need no lock.
+	anyStorePath := false
+	for _, g := range groups {
 		if g.storePath != "" {
-			ca, err := store.IsContentAddressed(g.storePath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "fix: %s: cannot determine if content-addressed, refusing: %v\n", g.storePath, err)
-				continue
-			}
-			if ca {
-				say("SKIP    %s: content-addressed; repairing would break its content address (see THREAT-MODEL.md)\n", g.storePath)
-				continue
-			}
+			anyStorePath = true
+			break
 		}
+	}
 
-		if g.storePath != "" && !fixLive {
-			blockers, err := store.Blockers(g.storePath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "fix: %s: %v\n", g.storePath, err)
-				continue
-			}
-			if len(blockers) > 0 {
-				say("SKIP    %s: in use (%s%s); repairing it in place would leave its recorded hash stale.\n",
-					g.storePath, blockers[0], more(blockers))
-				say("        Re-run with --fix-live to repair a GC-rooted path (e.g. a login shell) and reconcile its hash.\n")
-				continue
-			}
-		}
+	runRepairs := func() error {
+		for _, key := range order {
+			g := groups[key]
 
-		// Repair every broken file in the group on disk, hardlink-safely.
-		// Each file's changes go into the journal the moment its rename
-		// lands: a failure later in the group (or at re-registration)
-		// must not lose the undo records of bytes already on disk.
-		repairedInGroup := 0
-		ok := true
-		for _, f := range g.files {
-			changes, err := repairFileHardlinkSafe(f.File)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "fix: %s: %v\n", f.File, err)
-				ok = false
-				break
-			}
-			journal = append(journal, journalEntry{File: f.File, Time: time.Now(), Changes: changes})
-			repairedInGroup++
-			say("REPAIRED  %s  (%d slot(s))\n", f.File, len(changes))
-		}
-		if !ok {
-			continue
-		}
+			// A rooted or referenced store path is live — a login shell, a
+			// current system generation. Repairing something in use needs
+			// the operator's explicit consent: without --fix-live, refuse.
+			// (The hash reconciliation below works for rooted and unrooted
+			// paths alike; the distinction is consent, not mechanism.)
+			reconcile := g.storePath != ""
 
-		// Make the database hash row match the repaired bytes:
-		// re-register validity with the recomputed NAR hash, in place.
-		// (export/delete/import is NOT usable here: `nix-store
-		// --export` verifies the recorded hash before streaming, so it
-		// always fails on a just-repaired path.)
-		if reconcile {
-			if err := store.ReconcileHash(g.storePath); err != nil {
-				fmt.Fprintf(os.Stderr, "fix: %s: %v\n", g.storePath, err)
-				fmt.Fprintf(os.Stderr, "      (files were repaired on disk but the recorded hash is now stale; `nix store verify` will report it)\n")
+			// A content-addressed path's name IS a function of its bytes:
+			// repairing it would break the content address. Refusal class
+			// (THREAT-MODEL); no --fix variant overrides it. A failed query
+			// also refuses — unknown must never be treated as repairable.
+			if g.storePath != "" {
+				ca, err := store.IsContentAddressed(g.storePath)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "fix: %s: cannot determine if content-addressed, refusing: %v\n", g.storePath, err)
+					continue
+				}
+				if ca {
+					say("SKIP    %s: content-addressed; repairing would break its content address (see THREAT-MODEL.md)\n", g.storePath)
+					continue
+				}
+			}
+
+			if g.storePath != "" && !fixLive {
+				blockers, err := store.Blockers(g.storePath)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "fix: %s: %v\n", g.storePath, err)
+					continue
+				}
+				if len(blockers) > 0 {
+					say("SKIP    %s: in use (%s%s); repairing it in place would leave its recorded hash stale.\n",
+						g.storePath, blockers[0], more(blockers))
+					say("        Re-run with --fix-live to repair a GC-rooted path (e.g. a login shell) and reconcile its hash.\n")
+					continue
+				}
+			}
+
+			// Repair every broken file in the group on disk, hardlink-safely.
+			// Each file's changes go into the journal the moment its rename
+			// lands: a failure later in the group (or at re-registration)
+			// must not lose the undo records of bytes already on disk.
+			repairedInGroup := 0
+			ok := true
+			for _, f := range g.files {
+				changes, err := repairFileHardlinkSafe(f.File)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "fix: %s: %v\n", f.File, err)
+					ok = false
+					break
+				}
+				journal = append(journal, journalEntry{File: f.File, Time: time.Now(), Changes: changes})
+				repairedInGroup++
+				say("REPAIRED  %s  (%d slot(s))\n", f.File, len(changes))
+			}
+			if !ok {
 				continue
 			}
-			say("re-registered %s\n", g.storePath)
+
+			// Make the database hash row match the repaired bytes:
+			// re-register validity with the recomputed NAR hash, in place.
+			// (export/delete/import is NOT usable here: `nix-store
+			// --export` verifies the recorded hash before streaming, so it
+			// always fails on a just-repaired path.)
+			if reconcile {
+				if err := store.ReconcileHash(g.storePath); err != nil {
+					fmt.Fprintf(os.Stderr, "fix: %s: %v\n", g.storePath, err)
+					fmt.Fprintf(os.Stderr, "      (files were repaired on disk but the recorded hash is now stale; `nix store verify` will report it)\n")
+					continue
+				}
+				say("re-registered %s\n", g.storePath)
+			}
+			fixed += repairedInGroup
 		}
-		fixed += repairedInGroup
+		return nil
+	}
+
+	if anyStorePath {
+		_ = withGCLock(runRepairs)
+	} else {
+		_ = runRepairs()
 	}
 
 	if len(journal) > 0 {

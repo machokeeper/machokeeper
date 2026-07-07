@@ -94,6 +94,45 @@ schedule is wasted work and standing state. The one-shot first-enable
 sweep (repair what is already broken, once, recorded by a marker file)
 plus `doctor` on demand replace it.
 
+## Store-write safety (GC and optimise)
+
+The in-daemon patch repairs a path *before it is registered valid*,
+inside `addToStore` under a temp root and a per-path lock, and before
+`optimisePath`. GC and `optimiseStore` only ever touch already-valid
+paths, so that ordering makes the repair race-free by construction — no
+explicit lock is needed.
+
+machokeeper repairs *after* the path is valid (and possibly already
+hardlinked by `auto-optimise-store`), so it cannot rely on that
+ordering. It defends the store-write path three ways:
+
+- **Atomic, hardlink-safe writes.** Every repaired file is written to a
+  sibling temp and `rename`d over the original — atomic on a
+  same-filesystem rename, and a *fresh inode*, so a hardlink shared by
+  `auto-optimise-store` is never written through. This is the same
+  atomic rename optimise itself uses.
+- **GC coordination.** During a store-path repair, machokeeper holds
+  nix's GC lock (`/nix/var/nix/gc.lock`) in **shared** mode — the same
+  `flock(LOCK_SH)` the daemon takes for its own store writes (GC takes
+  it `LOCK_EX`). So a concurrent `nix-store --gc` cannot collect a path
+  mid-repair. Best-effort: if the lock can't be taken, the repair still
+  proceeds (the other two defenses hold).
+- **Detectable, self-healing.** After repair the recorded NAR hash is
+  reconciled to the repaired bytes, so any regression is caught by
+  `nix-store --verify --check-contents` and fixed by a re-run.
+
+The shared GC lock deliberately does **not** exclude a concurrent
+`nix-store --optimise` (which also takes it shared). That leaves one
+narrow race: an optimise that reads a file's pre-repair bytes and then
+renames a hardlink-to-stale-canonical over it *after* the repair, in the
+few milliseconds between machokeeper's read and its rename. Excluding it
+would require taking the GC lock *exclusive* — making `doctor --fix`
+behave like GC and stall the whole daemon for the scan. The race is not
+worth that cost: it needs a manual `--optimise` running concurrently
+with `--fix`, and its result (bytes regressed, DB hash still repaired)
+is caught by `nix-store --verify` and undone by a re-run — never silent
+corruption.
+
 ## What is out of scope
 
 - **Content-addressed cold-build corruption** ([#6065](https://github.com/NixOS/nix/issues/6065))
