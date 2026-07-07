@@ -53,30 +53,46 @@ evaluation) — so a failed run is retried once after a repair sweep of
 what it did pull. `wrap` needs no proxy and no signing keys.
 
 The build and system-rebuild doors are guarded automatically by the
-module; **the ad-hoc substitution door is the only one that needs `wrap`
-around the command.** For interactive use this can be made transparent
-with a shell alias/function that routes `nix` through `machokeeper wrap
--- nix` (see the module's shell-integration option).
+module — that is the primary delivery. **The ad-hoc substitution door is
+the only one that needs `wrap` around the command**, so `wrap` is the
+optional second layer, not the main guard. For interactive use it can be
+made transparent with a shell alias/PATH shim that routes `nix` through
+`machokeeper wrap -- nix`. That shim has one honest limit: it only sees
+invocations that go through it — a script hard-coding
+`/run/current-system/sw/bin/nix` bypasses the alias. That bypass is
+exactly why the module (hook + activation scan), which nothing in a
+generation can dodge, is primary and `wrap` is secondary.
 
 ## Relationship to the in-daemon patch
 
-The out-of-band doors cover the same paths as the in-daemon patch, with
-one behavioral difference: the daemon patch is transparent at the
-substitution door (any process is covered), while machokeeper guards
-that door by wrapping the command. So:
+machokeeper is the deliberate salvage of the in-daemon C++ repair after
+[NixOS/nix#15638](https://github.com/NixOS/nix/pull/15638) was declined
+upstream (keep Mach-O format knowledge out of libstore). It carries the
+same validated repair math, out of tree by design — no daemon fork, no
+`trusted-users`, no signing keys.
 
-- **Build and system-rebuild doors** are covered automatically and are a
-  drop-in replacement for the patch's coverage of those paths.
-- **The ad-hoc substitution door** needs `wrap` (or a shell wrapper that
-  applies it transparently). Without that, an ad-hoc `nix run` of a
-  freshly-substituted darwin binary that is executed immediately is the
-  one case the patch catches inline that machokeeper does not — unless
-  the command was wrapped.
+The out-of-band doors cover the same entry points as the in-daemon
+patch, and differ on exactly **one axis: pre-registration vs pre-use.**
 
-A periodic sweep can catch substituted paths shortly after they land,
-but "eventually" is not "inline": a binary could be page-in-killed once
-before the sweep reaches it. The sweep is therefore a safety net, not a
-substitute for `wrap` at the substitution door.
+- The in-daemon patch repairs bytes *before they are registered* as a
+  valid store path — broken bytes never enter the store, so there is
+  nothing to race.
+- machokeeper repairs *before first use*: the activation scan repairs a
+  generation's paths after substitution but before the generation goes
+  live, and the post-build hook repairs an output before it is used. For
+  the reported pain — a broken login shell, a broken build input at the
+  next rebuild — pre-use is **nearly equivalent** to pre-registration.
+- The residual difference is the ad-hoc substitution door: an ad-hoc
+  `nix run` of a freshly-substituted darwin binary executed immediately,
+  outside `wrap`, is the one case the inline patch catches that
+  machokeeper does not unless the command was wrapped.
+
+A recurring maintenance timer was **considered and deliberately
+rejected** ("no daemons, no timers, no state"): a steady-state store is
+empty of new breakage between generations, so patrolling it on a
+schedule is wasted work and standing state. The one-shot first-enable
+sweep (repair what is already broken, once, recorded by a marker file)
+plus `doctor` on demand replace it.
 
 ## What is out of scope
 
