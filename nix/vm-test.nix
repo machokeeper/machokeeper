@@ -54,16 +54,18 @@ pkgs.testers.runNixOSTest {
     # doctor writes repaired bytes into store files directly (its real
     # deployment is root on darwin, no read-only bind mount); NixOS
     # mounts /nix/store read-only, so lift that for the test.
-    virtualisation.writableStore = true;
     boot.nixStoreMountOpts = [ "rw" ];
-    # Enough RAM for nix-store --verify --check-contents over the store.
-    virtualisation.memorySize = 3072;
-    # The broken fixtures, registered as valid paths in the VM's store.
-    virtualisation.additionalPaths = [
-      pkgUnrooted
-      pkgRooted
-      pkgCms
-    ];
+    virtualisation = {
+      writableStore = true;
+      # Enough RAM for nix-store --verify --check-contents over the store.
+      memorySize = 3072;
+      # The broken fixtures, registered as valid paths in the VM's store.
+      additionalPaths = [
+        pkgUnrooted
+        pkgRooted
+        pkgCms
+      ];
+    };
     environment.systemPackages = [ machokeeper ];
   };
 
