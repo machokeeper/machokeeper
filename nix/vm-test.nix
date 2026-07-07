@@ -38,6 +38,10 @@ pkgs.testers.runNixOSTest {
 
   nodes.machine = _: {
     virtualisation.writableStore = true;
+    # NixOS bind-mounts /nix/store read-only; doctor writes repaired
+    # bytes directly to store files (as root on darwin, its real
+    # target, where no such mount exists). Lift it for the test.
+    boot.readOnlyNixStore = false;
     nix.settings.sandbox = false;
     environment.systemPackages = [ machokeeper ];
   };
