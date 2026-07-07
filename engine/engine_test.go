@@ -744,3 +744,44 @@ func TestRepairFatWithCMSSliceTouchesNothing(t *testing.T) {
 		t.Fatal("refusal touched bytes: the repairable slice was modified before the CMS slice was seen")
 	}
 }
+
+// TestDetectThin32BitHeader ports the C++ thin32BitHeader case: a
+// 32-bit mach_header (28 bytes, MH_MAGIC) with an LC_CODE_SIGNATURE
+// whose SuperBlob is out of bounds is still detected as signed
+// (fail toward detection). The 32-bit header path is otherwise
+// exercised only by real binaries.
+func TestDetectThin32BitHeader(t *testing.T) {
+	s := make([]byte, 28+16)
+	putLE32(s, 0, machMagic32)
+	putLE32(s, 16, 1)  // ncmds
+	putLE32(s, 20, 16) // sizeofcmds
+	putLE32(s, 28+0, lcCodeSignature)
+	putLE32(s, 28+4, 16)
+	putLE32(s, 28+8, 0xffff0000) // dataoff far beyond EOF
+	putLE32(s, 28+12, 64)
+	if Detect(s) != AdHoc {
+		t.Fatal("32-bit signed header with OOB SuperBlob must detect AdHoc")
+	}
+	// And check must flag it (present signature, unverifiable).
+	if !Check(s, "test") {
+		t.Fatal("32-bit unverifiable signature must fail check")
+	}
+}
+
+// TestDetectBigJavaClassFile ports the C++ big-class-file case: a large
+// file sharing the fat magic (Java .class, version field read as
+// nfat_arch) has room for the phantom arch table, but its garbage
+// "slices" carry no Mach-O magic, so it is None. The small class file
+// (rejected earlier by the arch-array bounds check) is a different
+// path, covered by TestDetectJavaClassFile.
+func TestDetectBigJavaClassFile(t *testing.T) {
+	big := bytes.Repeat([]byte{0x5a}, 8192)
+	putBE32(big, 0, 0xcafebabe)
+	putBE32(big, 4, 65) // major version 65 (Java 21) read as nfat_arch
+	if Detect(big) != None {
+		t.Fatal("big class file: phantom slices carry no Mach-O magic, must be None")
+	}
+	if Check(big, "test") {
+		t.Fatal("big class file must not be flagged")
+	}
+}

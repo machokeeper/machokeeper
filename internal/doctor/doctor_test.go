@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -723,4 +724,83 @@ func TestDoctorFixMultiFileGroupReregistersOnce(t *testing.T) {
 	if len(j) != 3 {
 		t.Errorf("journal entries = %d, want 3", len(j))
 	}
+}
+
+func TestScanFileOversizedIsUnverifiableFailClosed(t *testing.T) {
+	// A Mach-O-magic file above the size bound must be reported
+	// unverifiable WITHOUT being loaded, and must never be repairable.
+	// Uses a low env cap so no gigabyte fixture is needed.
+	t.Setenv("MACHOKEEPER_MAX_FILE_SIZE", "1024")
+	dir := t.TempDir()
+	f := filepath.Join(dir, "huge.dylib")
+	// A valid (repaired) small Mach-O would normally pass; make it
+	// bigger than the cap by padding after a real signed shape so the
+	// magic peek still fires.
+	blob := machofixture.Repairable(2) // ~8 KiB, > 1024 cap
+	if err := os.WriteFile(f, blob, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fnd := scanFile(f)
+	if fnd == nil {
+		t.Fatal("oversized Mach-O must be reported, not skipped")
+	}
+	if fnd.Repairable {
+		t.Error("oversized file must never be repairable")
+	}
+	if !strings.Contains(fnd.Class, "unverifiable") {
+		t.Errorf("class = %q, want an unverifiable notice", fnd.Class)
+	}
+
+	// check must fail closed (exit 2) on it.
+	withStore(t, &fakeStore{})
+	if rc := Check([]string{f}); rc != 2 {
+		t.Errorf("check(oversized) = %d, want 2 (fail closed)", rc)
+	}
+	// --fix must not repair it (nothing repairable) and must not
+	// corrupt it: exit 2, bytes intact.
+	before, _ := os.ReadFile(f)
+	chdir(t, dir)
+	if rc := Run([]string{"--quiet", "--fix", f}); rc != 2 {
+		t.Errorf("fix(oversized) = %d, want 2", rc)
+	}
+	after, _ := os.ReadFile(f)
+	if string(after) != string(before) {
+		t.Error("oversized file was modified")
+	}
+}
+
+func TestScanFileSubCapStillVerified(t *testing.T) {
+	// A file under the cap is scanned normally: a valid one is healthy,
+	// a broken one is a finding. Guards against the size gate being too
+	// aggressive.
+	t.Setenv("MACHOKEEPER_MAX_FILE_SIZE", "1048576") // 1 MiB, well above fixtures
+	dir := t.TempDir()
+	broken := filepath.Join(dir, "broken")
+	os.WriteFile(broken, machofixture.Repairable(2), 0o644)
+	if fnd := scanFile(broken); fnd == nil || !fnd.Repairable {
+		t.Fatalf("sub-cap broken file must be a repairable finding: %+v", fnd)
+	}
+	valid := machofixture.Repairable(2)
+	engine.Repair(valid, "x")
+	good := filepath.Join(dir, "good")
+	os.WriteFile(good, valid, 0o644)
+	if fnd := scanFile(good); fnd != nil {
+		t.Errorf("sub-cap valid file must be healthy: %+v", fnd)
+	}
+}
+
+func TestReadForScanFallbackWhenTooLargeToLoad(t *testing.T) {
+	// When mmap is unavailable (or fails) and the file exceeds the
+	// in-memory bound, readForScan refuses rather than heap-loading.
+	// We can't easily force mmap to fail, so exercise the bound logic
+	// through scanFile with an in-memory cap below file size but a file
+	// cap above it: the mmap path still succeeds on unix, so this
+	// mainly documents the intended contract and runs clean.
+	t.Setenv("MACHOKEEPER_MAX_IN_MEMORY_SIZE", "1")
+	dir := t.TempDir()
+	f := filepath.Join(dir, "broken")
+	os.WriteFile(f, machofixture.Repairable(2), 0o644)
+	// On unix mmap succeeds, so the file is still scanned (a finding).
+	// The assertion is only that scanFile does not panic or misbehave.
+	_ = scanFile(f)
 }

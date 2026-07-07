@@ -12,12 +12,44 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/machokeeper/machokeeper/engine"
 	"github.com/machokeeper/machokeeper/internal/nixstore"
 )
+
+// maxMachOFileSize is the largest Mach-O file whose signature can be
+// verified: the CodeDirectory codeLimit field is 32 bits, so a
+// signature over more than 4 GiB needs the codeLimit64 variant this
+// engine does not support — such a file is genuinely unverifiable.
+// Scanning also never loads a file this large into memory (the parallel
+// store scan would risk OOM). A Mach-O-magic file above the bound is
+// reported unverifiable without being read (fail closed). Overridable
+// via MACHOKEEPER_MAX_FILE_SIZE (bytes) so tests exercise the oversized
+// path without gigabyte fixtures. Mirrors nix's maxMachOFileSize.
+func maxMachOFileSize() int64 {
+	return sizeBoundFromEnv("MACHOKEEPER_MAX_FILE_SIZE", 4<<30)
+}
+
+// maxMachOInMemorySize is the largest file scanFile will heap-read when
+// it cannot be memory-mapped. Checking is cheap at any size via mmap;
+// an unbounded fallback read is not, so a file above this bound that
+// cannot be mapped is reported unverifiable (fail closed) rather than
+// loaded. Overridable via MACHOKEEPER_MAX_IN_MEMORY_SIZE.
+func maxMachOInMemorySize() int64 {
+	return sizeBoundFromEnv("MACHOKEEPER_MAX_IN_MEMORY_SIZE", 512<<20)
+}
+
+func sizeBoundFromEnv(envVar string, dflt int64) int64 {
+	if v := os.Getenv(envVar); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return dflt
+}
 
 // storeBackend is the set of Nix store operations repair needs. It is
 // an interface so tests can drive the full fix / fix-live flow without a
@@ -70,10 +102,29 @@ func scanFile(path string) *Finding {
 	if _, err := io.ReadFull(f, peek); err != nil || !engine.HasMachOMagic(peek) {
 		return nil
 	}
-	data, err := os.ReadFile(path)
+	fi, err := f.Stat()
 	if err != nil {
 		return nil
 	}
+	size := fi.Size()
+
+	// A Mach-O-magic file too large for its signature to be verified —
+	// or unmappable and too large to load — is reported unverifiable
+	// without being read. It could carry a signature the rewrite would
+	// invalidate, so fail closed rather than silently pass it, and never
+	// risk OOM loading it under the parallel scan.
+	if size > maxMachOFileSize() {
+		return oversizedFinding(path, size)
+	}
+	data, unmap, err := readForScan(f, size)
+	if err != nil {
+		if err == errTooLargeToLoad {
+			return oversizedFinding(path, size)
+		}
+		return nil
+	}
+	defer unmap()
+
 	kind := engine.Detect(data)
 	if kind == engine.None {
 		return nil
@@ -103,6 +154,43 @@ func scanFile(path string) *Finding {
 		Kind:       kind,
 		Class:      class,
 		Repairable: repairable,
+	}
+}
+
+// errTooLargeToLoad: the file cannot be mapped and is larger than
+// maxMachOInMemorySize, so readForScan refuses to heap-load it.
+var errTooLargeToLoad = fmt.Errorf("file too large to load")
+
+// readForScan returns the bytes to inspect: a read-only mmap where
+// possible (no heap cost — detection reads a few scattered KiB), else a
+// bounded heap read. unmap must be called when the bytes are done.
+func readForScan(f *os.File, size int64) (data []byte, unmap func(), err error) {
+	if size == 0 {
+		return nil, func() {}, nil
+	}
+	if mapped, munmap, err := mmapRead(f, size); err == nil {
+		return mapped, munmap, nil
+	}
+	if size > maxMachOInMemorySize() {
+		return nil, nil, errTooLargeToLoad
+	}
+	b, err := os.ReadFile(f.Name())
+	if err != nil {
+		return nil, nil, err
+	}
+	return b, func() {}, nil
+}
+
+// oversizedFinding reports a Mach-O file that could not be verified
+// because it exceeds the size bounds. Unrepairable and fail-closed: the
+// check exit contract treats it as stale so a broken oversized binary
+// is never silently accepted.
+func oversizedFinding(path string, size int64) *Finding {
+	return &Finding{
+		File:       path,
+		Kind:       engine.None,
+		Class:      fmt.Sprintf("unverifiable: %d bytes exceeds the verifiable size bound", size),
+		Repairable: false,
 	}
 }
 
