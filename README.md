@@ -46,7 +46,14 @@ A path that is a GC root or referenced by another path (a live login shell) is i
 
 ## Continuous protection (module)
 
-For nix-darwin, NixOS, or home-manager, enable the module and every door bytes enter your store by is guarded — no daemon, no timer:
+machokeeper guards every *door* stale-signature bytes enter a store by —
+local build, system rebuild, ad-hoc substitution, already-broken store —
+each with one mechanism, and none requiring a patched daemon. The full
+model is in [docs/DESIGN.md](docs/DESIGN.md).
+
+For nix-darwin, NixOS, or home-manager, enable the module and the build
+and system-rebuild doors are guarded automatically — no daemon, no timer
+(the ad-hoc substitution door is guarded by [`wrap`](#ad-hoc-commands-wrap)):
 
 ```nix
 {

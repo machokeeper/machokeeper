@@ -3,7 +3,8 @@
 machokeeper parses attacker-influenceable bytes (store files come from
 builders and substituters) and mutates the Nix store, sometimes as root.
 This document says what we defend against, how, and what is out of
-scope.
+scope. For the architecture — the "doors" stale bytes enter a store by
+and the mechanism guarding each — see [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Assets
 
