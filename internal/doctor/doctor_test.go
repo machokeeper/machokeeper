@@ -7,6 +7,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/machokeeper/machokeeper/engine"
 	"github.com/machokeeper/machokeeper/internal/machofixture"
@@ -62,7 +63,14 @@ func withStore(t *testing.T, s storeBackend) {
 	}
 	prevDir := journalDir
 	journalDir = filepath.Join(blocker, "sub")
-	t.Cleanup(func() { store = prev; journalDir = prevDir })
+	// Never flock the real /nix/var/nix/gc.lock from a unit test: point
+	// the GC lock at a per-test temp file so the coordination code path
+	// runs against a harmless target.
+	prevLock := gcLockPath
+	lock := filepath.Join(t.TempDir(), "gc.lock")
+	_ = os.WriteFile(lock, nil, 0o644)
+	gcLockPath = lock
+	t.Cleanup(func() { store = prev; journalDir = prevDir; gcLockPath = prevLock })
 }
 
 // writeFixture writes a fixture blob and asserts the engine sees it the
@@ -803,4 +811,64 @@ func TestReadForScanFallbackWhenTooLargeToLoad(t *testing.T) {
 	// On unix mmap succeeds, so the file is still scanned (a finding).
 	// The assertion is only that scanFile does not panic or misbehave.
 	_ = scanFile(f)
+}
+
+func TestWithGCLockAcquiresAndFallsBack(t *testing.T) {
+	// Happy path: a real lock file is flocked (shared) and fn runs.
+	dir := t.TempDir()
+	lock := filepath.Join(dir, "gc.lock")
+	os.WriteFile(lock, nil, 0o644)
+	prev := gcLockPath
+	gcLockPath = lock
+	t.Cleanup(func() { gcLockPath = prev })
+
+	ran := false
+	if err := withGCLock(func() error { ran = true; return nil }); err != nil {
+		t.Fatalf("withGCLock err: %v", err)
+	}
+	if !ran {
+		t.Fatal("fn did not run under the lock")
+	}
+
+	// A second shared acquisition must succeed concurrently (LOCK_SH is
+	// shared): hold the lock, then acquire again from another goroutine.
+	unlock, err := gcLockShared(lock)
+	if err != nil {
+		t.Fatalf("first shared lock: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		u2, e := gcLockShared(lock)
+		if e == nil {
+			u2()
+		}
+		done <- e
+	}()
+	select {
+	case e := <-done:
+		if e != nil {
+			t.Errorf("second shared lock should coexist, got: %v", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second shared lock blocked; LOCK_SH must not exclude LOCK_SH")
+	}
+	unlock()
+
+	// Best-effort: a missing lock path still runs fn (fallback).
+	gcLockPath = filepath.Join(dir, "does-not-exist", "gc.lock")
+	ran = false
+	if err := withGCLock(func() error { ran = true; return nil }); err != nil {
+		t.Fatalf("fallback err: %v", err)
+	}
+	if !ran {
+		t.Fatal("fn must run even when the lock can't be acquired")
+	}
+
+	// Disabled ("") also runs fn.
+	gcLockPath = ""
+	ran = false
+	_ = withGCLock(func() error { ran = true; return nil })
+	if !ran {
+		t.Fatal("fn must run when coordination is disabled")
+	}
 }
