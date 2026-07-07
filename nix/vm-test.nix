@@ -36,13 +36,11 @@ in
 pkgs.testers.runNixOSTest {
   name = "machokeeper-nixstore";
 
-  nodes.machine =
-    { ... }:
-    {
-      virtualisation.writableStore = true;
-      nix.settings.sandbox = false;
-      environment.systemPackages = [ machokeeper ];
-    };
+  nodes.machine = _: {
+    virtualisation.writableStore = true;
+    nix.settings.sandbox = false;
+    environment.systemPackages = [ machokeeper ];
+  };
 
   testScript = ''
     machine.wait_for_unit("multi-user.target")
@@ -59,10 +57,9 @@ pkgs.testers.runNixOSTest {
     ).strip()
     print(f"store path: {store_path}")
 
-    # check must see it as stale (exit 2).
-    machine.fail(f"machokeeper check {store_path}")
+    # check must see it as stale (exit 2, specifically).
     status = machine.succeed(
-        f"machokeeper check {store_path}; echo rc=$?"
+        f"machokeeper check {store_path} && echo rc=0 || echo rc=$?"
     )
     assert "rc=2" in status, f"check exit code: {status}"
 
@@ -96,7 +93,7 @@ pkgs.testers.runNixOSTest {
     assert "keep-pkg2" in roots, f"root not registered: {roots}"
 
     # Plain --fix: refused (exit 2), bytes untouched.
-    out = machine.succeed(f"cd /root && machokeeper doctor --fix {rooted}; echo rc=$?")
+    out = machine.succeed(f"cd /root && (machokeeper doctor --fix {rooted} && echo rc=0 || echo rc=$?)")
     assert "rc=2" in out, f"rooted --fix should refuse: {out}"
     assert "SKIP" in out, f"expected SKIP notice: {out}"
     machine.fail(f"machokeeper check {rooted}")
@@ -114,13 +111,13 @@ pkgs.testers.runNixOSTest {
     )
     cms = machine.succeed("nix-store --add /root/pkg3").strip()
     before = machine.succeed(f"sha256sum {cms}/bin/devid").split()[0]
-    out = machine.succeed(f"cd /root && machokeeper doctor --fix {cms}; echo rc=$?")
+    out = machine.succeed(f"cd /root && (machokeeper doctor --fix {cms} && echo rc=0 || echo rc=$?)")
     assert "rc=2" in out, f"CMS fix must exit 2: {out}"
     after = machine.succeed(f"sha256sum {cms}/bin/devid").split()[0]
     assert before == after, "CMS-signed file was modified"
 
     # ---- Whole-store scan finds nothing left broken ----
-    out = machine.succeed(f"machokeeper doctor {cms} {store_path} {rooted}; echo rc=$?")
+    out = machine.succeed(f"machokeeper doctor {cms} {store_path} {rooted} && echo rc=0 || echo rc=$?")
     assert "rc=2" in out, "CMS finding keeps scan at exit 2"
   '';
 }
