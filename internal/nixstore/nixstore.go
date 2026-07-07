@@ -1,6 +1,19 @@
 // Package nixstore wraps the stock `nix-store` CLI operations machokeeper
 // needs, so repair uses only documented plumbing — no daemon patch, no
 // direct database access.
+//
+// Why the classic `nix-store` CLI and not a library or the new `nix`
+// CLI: the C `libnixstore` API is upstream-documented as "not yet
+// stable, in development"; the daemon worker protocol is a custom
+// binary format with no public spec (only reverse-engineered
+// implementations); and the new `nix store` unified CLI is gated behind
+// the `nix-command` experimental feature, so it refuses to run on a
+// stock daemon. machokeeper runs in post-build hooks and activation
+// scripts where none of experimental-features, a pinned Nix version, or
+// a linkable libstore can be assumed. Classic `nix-store` operations
+// (--query, --realise, --dump, --register-validity) carry no
+// experimental caveat and are the stable primitive. The one unavoidable
+// exception is IsContentAddressed (see there).
 package nixstore
 
 import (
@@ -127,10 +140,18 @@ func registrationLines(storePath, deriver, narHash string, narSize int64, refere
 }
 
 // IsContentAddressed reports whether `storePath` is content-addressed
-// (its name derives from its bytes, so a repair would break the
-// address). Reads the `ca` field of `nix path-info --json`, handling
-// both the pre-2.19 array form and the newer path-keyed object form.
-// Errors are returned, not swallowed: callers must fail closed.
+// (its name derives from its bytes — a fixed-output fetch or a text
+// path — so repairing it would break the address). This is the ONE
+// operation with no classic `nix-store --query` equivalent: the CA flag
+// lives only in the new CLI's path-info output. So it opts into the new
+// CLI explicitly with `--extra-experimental-features nix-command`,
+// which force-enables the feature for this one invocation regardless of
+// daemon config (that override flag is itself stable). The `ca` field's
+// JSON shape is "subject to change" and already has two forms (pre-2.19
+// array, newer path-keyed object), both handled in parsePathInfoCA.
+// Errors are returned, never swallowed: the doctor caller fails closed
+// (refuses to repair) when CA status can't be determined, since
+// repairing an actual CA path is a silent invariant violation.
 func IsContentAddressed(storePath string) (bool, error) {
 	out, err := exec.Command("nix", "--extra-experimental-features", "nix-command",
 		"path-info", "--json", storePath).Output()
