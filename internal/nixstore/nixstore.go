@@ -40,9 +40,8 @@ func StorePathOf(p string) (string, bool) {
 }
 
 // Roots returns the GC roots holding `storePath` alive. A non-empty
-// result means the path cannot be deleted (and so cannot be
-// re-registered via export/delete/import); such paths need the
-// in-place `--fix-live` route instead.
+// result means the path is live (in use); repairing it needs the
+// operator's explicit `--fix-live` consent.
 func Roots(storePath string) ([]string, error) {
 	out, err := exec.Command("nix-store", "--query", "--roots", storePath).Output()
 	if err != nil {
@@ -88,9 +87,12 @@ func DumpNAR(path string) ([]byte, error) {
 // and size, preserving its references and deriver, via
 // `nix-store --register-validity --reregister`. This updates the
 // database row in place — the path is not deleted — so it works on
-// GC-rooted paths that Reregister cannot touch. `references` and
-// `deriver` come from a prior query; `narHash` is the sha256 of the
-// repaired NAR in `sha256:<base32>` form.
+// live (even GC-rooted) paths. It is the ONLY route that works after
+// an in-place repair: `nix-store --export` verifies the recorded hash
+// before streaming, so export/delete/import can never round-trip a
+// just-repaired path. `references` and `deriver` come from a prior
+// query; `narHash` is the sha256 of the repaired NAR in
+// `sha256:<base32>` form.
 func RegisterValidity(storePath, deriver, narHash string, narSize int64, references []string) error {
 	cmd := exec.Command("nix-store", "--register-validity", "--reregister", "--hash-given")
 	cmd.Stdin = strings.NewReader(registrationLines(storePath, deriver, narHash, narSize, references))
@@ -192,55 +194,4 @@ func PathInfo(storePath string) (deriver string, references []string, err error)
 		}
 	}
 	return deriver, references, nil
-}
-
-// Reregister re-registers `storePath` from its current on-disk contents
-// via export → delete → import, so the database NAR hash matches the
-// repaired bytes. The path keeps its name (input-addressed paths do not
-// depend on their contents). Fails if the path is rooted or referenced;
-// callers must check Roots/Referrers first.
-func Reregister(storePath string) error {
-	tmp, err := os.CreateTemp("", "machokeeper-export-*.nar")
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tmp.Close() }()
-	// The export is the only copy of the path between delete and a
-	// successful import, so it is removed only after import succeeds; on
-	// an import failure it is kept and named in the error.
-	imported := false
-	defer func() {
-		if imported {
-			_ = os.Remove(tmp.Name())
-		}
-	}()
-
-	// export: streams the NAR from disk (repaired contents) plus the
-	// path's metadata; the NAR hash is recomputed on import.
-	exp := exec.Command("nix-store", "--export", storePath)
-	exp.Stdout = tmp
-	exp.Stderr = os.Stderr
-	if err := exp.Run(); err != nil {
-		imported = true // nothing was deleted; the export is worthless
-		return fmt.Errorf("exporting %s: %w", storePath, err)
-	}
-	if _, err := tmp.Seek(0, 0); err != nil {
-		imported = true
-		return err
-	}
-
-	if out, err := exec.Command("nix-store", "--delete", storePath).CombinedOutput(); err != nil {
-		imported = true
-		return fmt.Errorf("deleting %s (rooted or referenced?): %w: %s", storePath, err, strings.TrimSpace(string(out)))
-	}
-
-	imp := exec.Command("nix-store", "--import")
-	imp.Stdin = tmp
-	imp.Stderr = os.Stderr
-	if err := imp.Run(); err != nil {
-		return fmt.Errorf("re-importing %s failed — the path was deleted; its export is kept at %s (restore with `nix-store --import < %s`): %w",
-			storePath, tmp.Name(), tmp.Name(), err)
-	}
-	imported = true
-	return nil
 }

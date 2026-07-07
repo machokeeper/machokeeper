@@ -27,9 +27,9 @@ Usage:
   machokeeper version
   machokeeper help
 
-Without --fix, doctor only reports. --fix repairs unrooted store paths
-by re-registering them (correct NAR hash); --fix-live additionally
-repairs rooted paths in place and reconciles their hash. Repair rewrites
+Without --fix, doctor only reports. --fix repairs store paths in place
+and reconciles their recorded NAR hash; --fix-live additionally
+consents to repairing GC-rooted (live) paths. Repair rewrites
 only stale hash slots (byte-exact undo journal written next to the
 report; "machokeeper undo" applies it) and never touches
 Developer-ID-signed files or content-addressed paths.`
