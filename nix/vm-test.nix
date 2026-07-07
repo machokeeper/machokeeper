@@ -2,19 +2,19 @@
 # store database — the layer the unit tests fake out via storeBackend.
 #
 # What only this test can prove:
-#   - Reregister's export → delete → import round-trip on a live DB
-#     (doctor --fix on an unrooted store path), and that the recorded
-#     NAR hash matches the repaired bytes afterwards
-#     (`nix-store --verify --check-contents` stays silent).
-#   - --fix-live's --register-validity hash reconciliation on a
-#     GC-ROOTED path, without deleting it.
-#   - Roots/Referrers blocker detection against real GC roots: plain
-#     --fix must refuse a rooted path.
-#   - The CMS refusal and undo journal round-trip through the real CLI
-#     on files inside /nix/store.
+#   - doctor --fix reconciling an unrooted store path's recorded NAR
+#     hash in place (--register-validity --reregister --hash-given) so
+#     `nix-store --verify --check-contents` accepts the repaired bytes.
+#   - --fix refusing a GC-rooted path via real --query --roots output,
+#     and --fix-live reconciling it.
+#   - CMS refusal, content-addressed refusal, and the undo journal
+#     round-trip through the real CLI on files inside /nix/store.
 #
-# The fixtures are machofixture's byte blobs (Mach-O is just bytes; no
-# macOS needed). Nothing is executed from the store paths.
+# The broken binaries are built on the HOST as ordinary derivations
+# (input-addressed, so their recorded hash is a real hash of the broken
+# bytes) and copied into the VM via additionalPaths — no in-VM building,
+# no network, no OOM. Mach-O is just bytes, so no macOS host is needed
+# and nothing from the store is executed.
 {
   pkgs,
   self,
@@ -32,74 +32,75 @@ let
       '';
 
   machokeeper = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+
+  # A broken package as a host-built store path: input-addressed, so the
+  # daemon records a real NAR hash of the broken bytes. Distinct names
+  # give distinct paths (identical bytes would collide).
+  brokenPkg =
+    name: fixture: file:
+    pkgs.runCommand name { } ''
+      mkdir -p $out/bin
+      cp ${fixtures}/${fixture} $out/bin/${file}
+      chmod +x $out/bin/${file}
+    '';
+  pkgUnrooted = brokenPkg "mk-unrooted" "repairable" "tool";
+  pkgRooted = brokenPkg "mk-rooted" "repairable" "tool2";
+  pkgCms = brokenPkg "mk-cms" "cms" "devid";
 in
 pkgs.testers.runNixOSTest {
   name = "machokeeper-nixstore";
 
   nodes.machine = _: {
+    # doctor writes repaired bytes into store files directly (its real
+    # deployment is root on darwin, no read-only bind mount); NixOS
+    # mounts /nix/store read-only, so lift that for the test.
     virtualisation.writableStore = true;
-    # NixOS bind-mounts /nix/store read-only; doctor writes repaired
-    # bytes directly to store files (as root on darwin, its real
-    # target, where no such mount exists). Mount it writable for the
-    # test.
     boot.nixStoreMountOpts = [ "rw" ];
-    nix.settings.sandbox = false;
+    # Enough RAM for nix-store --verify --check-contents over the store.
+    virtualisation.memorySize = 3072;
+    # The broken fixtures, registered as valid paths in the VM's store.
+    virtualisation.additionalPaths = [
+      pkgUnrooted
+      pkgRooted
+      pkgCms
+    ];
     environment.systemPackages = [ machokeeper ];
   };
 
   testScript = ''
     machine.wait_for_unit("multi-user.target")
 
-    # Build INPUT-addressed store paths carrying the fixtures: repair +
-    # re-registration is only legal for input addressing, and
-    # `nix-store --add` would produce a content-addressed path (that
-    # case gets its own refusal test below). Sandbox is off, so the
-    # builder can use /bin/sh.
-    def build_pkg(name, fixture, filename, out_link=None):
-        link = f"-o {out_link}" if out_link else "--no-out-link"
-        # Raw `derivation`: no stdenv, so the builder gets no PATH —
-        # point it at coreutils explicitly (host store paths are visible
-        # through the VM's store share).
-        expr = (
-            "derivation { name = \"" + name + "\"; "
-            "system = builtins.currentSystem; "
-            "builder = \"/bin/sh\"; "
-            "args = [ \"-c\" \""
-            "export PATH=${pkgs.coreutils}/bin && mkdir -p $out/bin && "
-            "cp ${fixtures}/" + fixture + " $out/bin/" + filename + " && "
-            "chmod +x $out/bin/" + filename + "\" ]; }"
-        )
-        return machine.succeed(f"nix-build {link} --expr '{expr}'").strip().splitlines()[-1]
+    store_path = "${pkgUnrooted}"
+    rooted = "${pkgRooted}"
+    cms = "${pkgCms}"
 
-    store_path = build_pkg("pkg", "repairable", "tool")
-    print(f"store path: {store_path}")
-
-    # check must see it as stale (exit 2, specifically).
-    status = machine.succeed(
-        f"machokeeper check {store_path} && echo rc=0 || echo rc=$?"
-    )
+    # check must see the unrooted path as stale (exit 2, specifically).
+    status = machine.succeed(f"machokeeper check {store_path} && echo rc=0 || echo rc=$?")
     assert "rc=2" in status, f"check exit code: {status}"
 
-    # ---- Unrooted repair: full export/delete/import re-registration ----
+    # ---- Unrooted repair: in-place hash reconciliation ----
     machine.succeed(f"cd /root && machokeeper doctor --fix {store_path}")
     machine.succeed(f"machokeeper check {store_path}")
-
-    # The database NAR hash must match the repaired bytes: a full
-    # content verification over the store must not complain about it.
+    # The recorded NAR hash must match the repaired bytes: a full content
+    # verification over the store must not complain about this path.
     machine.succeed("nix-store --verify --check-contents 2>&1 | tee /dev/stderr | (! grep -i 'differs\\|corrupt')")
 
     # The undo journal exists and undo restores the broken bytes.
-    journal = machine.succeed("ls /root/machokeeper-undo-*.json /nix/var/machokeeper/machokeeper-undo-*.json 2>/dev/null | head -1").strip()
+    # (find over existing dirs, so the pipe doesn't trip pipefail the
+    # way a non-matching `ls` glob would.)
+    journal = machine.succeed(
+        "find /root /nix/var/machokeeper -name 'machokeeper-undo-*.json' 2>/dev/null | head -1"
+    ).strip()
     assert journal, "no undo journal written"
     machine.succeed(f"machokeeper undo {journal}")
     machine.fail(f"machokeeper check {store_path}")
-    # Re-repair so the store is coherent again for the next phase.
+    # Re-repair so the store is coherent again for the whole-store checks.
     machine.succeed(f"cd /root && machokeeper doctor --fix {store_path}")
 
     # ---- Rooted path: --fix must refuse, --fix-live must reconcile ----
-    rooted = build_pkg("pkg2", "repairable", "tool2", out_link="/root/keep-pkg2")
+    machine.succeed(f"ln -sfn {rooted} /nix/var/nix/gcroots/keep-rooted")
     roots = machine.succeed(f"nix-store --query --roots {rooted}")
-    assert "keep-pkg2" in roots, f"root not registered: {roots}"
+    assert "keep-rooted" in roots, f"root not registered: {roots}"
 
     # Plain --fix: refused (exit 2), bytes untouched.
     out = machine.succeed(f"cd /root && (machokeeper doctor --fix {rooted} && echo rc=0 || echo rc=$?)")
@@ -113,7 +114,6 @@ pkgs.testers.runNixOSTest {
     machine.succeed("nix-store --verify --check-contents 2>&1 | tee /dev/stderr | (! grep -i 'differs\\|corrupt')")
 
     # ---- CMS: never touched, even with --fix ----
-    cms = build_pkg("pkg3", "cms", "devid")
     before = machine.succeed(f"sha256sum {cms}/bin/devid").split()[0]
     out = machine.succeed(f"cd /root && (machokeeper doctor --fix {cms} && echo rc=0 || echo rc=$?)")
     assert "rc=2" in out, f"CMS fix must exit 2: {out}"
@@ -121,8 +121,9 @@ pkgs.testers.runNixOSTest {
     assert before == after, "CMS-signed file was modified"
 
     # ---- Content-addressed path: refused, bytes untouched ----
-    # `nix-store --add` registers a CA path (text/fixed addressing):
-    # exactly the refusal class the CA guard exists for.
+    # `nix-store --add` registers a CA path (text/fixed addressing) — no
+    # build, so it is cheap — exactly the refusal class the guard exists
+    # for.
     machine.succeed(
         "mkdir -p /root/capkg/bin",
         "cp ${fixtures}/repairable /root/capkg/bin/catool",
@@ -134,7 +135,7 @@ pkgs.testers.runNixOSTest {
     assert "content-addressed" in out, f"expected CA skip notice: {out}"
     machine.fail(f"machokeeper check {ca_path}")  # still broken, untouched
 
-    # ---- Whole-store scan finds nothing left broken ----
+    # ---- Whole-store scan still flags the CMS path (exit 2) ----
     out = machine.succeed(f"machokeeper doctor {cms} {store_path} {rooted} && echo rc=0 || echo rc=$?")
     assert "rc=2" in out, "CMS finding keeps scan at exit 2"
   '';
