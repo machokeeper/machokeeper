@@ -40,9 +40,9 @@ The engine is a port of the repair validated on the [NixOS/nix#15638](https://gi
 
 ## Repairing store paths
 
-`doctor --fix` repairs a registered store path safely. It writes each repaired file to a sibling temp and renames it into place, so a file that `auto-optimise-store` hardlinks across paths is not corrupted through its other names, and it re-registers the path with `nix-store --export | --delete | --import` so the database NAR hash matches the repaired bytes (the path keeps its name — input-addressed paths do not depend on their contents). Repair may need `sudo` on a multi-user install; doctor prints the operations before it runs them.
+`doctor --fix` repairs a registered store path safely. It writes each repaired file to a sibling temp and renames it into place, so a file that `auto-optimise-store` hardlinks across paths is not corrupted through its other names, and it reconciles the path's recorded NAR hash in place with `nix-store --register-validity --reregister --hash-given` so the database matches the repaired bytes (the path keeps its name — input-addressed paths do not depend on their contents). Repair may need `sudo` on a multi-user install; doctor prints the operations before it runs them.
 
-A path that is a GC root or referenced by another path (a live login shell) cannot be deleted, so `--fix` refuses it. `doctor --fix-live` repairs such a path in place and reconciles its recorded hash directly (no delete). Use it when your shell itself is broken.
+A path that is a GC root or referenced by another path (a live login shell) is in use, so `--fix` refuses it. `doctor --fix-live` is the explicit consent to repair such a live path; the repair and hash reconciliation are the same. Use it when your shell itself is broken.
 
 ## Continuous protection (module)
 

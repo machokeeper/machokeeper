@@ -25,7 +25,6 @@ import (
 type storeBackend interface {
 	StorePathOf(file string) (string, bool)
 	Blockers(storePath string) ([]string, error)
-	Reregister(storePath string) error
 	ReconcileHash(storePath string) error
 	IsContentAddressed(storePath string) (bool, error)
 }
@@ -33,7 +32,6 @@ type storeBackend interface {
 type realStore struct{}
 
 func (realStore) StorePathOf(f string) (string, bool) { return nixstore.StorePathOf(f) }
-func (realStore) Reregister(p string) error           { return nixstore.Reregister(p) }
 func (realStore) Blockers(p string) ([]string, error) { return storePathBlockers(p) }
 func (realStore) ReconcileHash(p string) error        { return reconcileHash(p) }
 func (realStore) IsContentAddressed(p string) (bool, error) {
@@ -285,14 +283,12 @@ func Run(args []string) int {
 	for _, key := range order {
 		g := groups[key]
 
-		// A rooted or referenced store path cannot be deleted, so it
-		// cannot be re-registered via export/delete/import. Without
-		// --fix-live, refuse: repairing its bytes in place while
-		// leaving the database NAR hash stale would let
-		// `nix store verify --repair` regress it to the broken cached
-		// copy. With --fix-live, repair in place and reconcile the hash
-		// row directly (below).
-		reregister := g.storePath != ""
+		// A rooted or referenced store path is live — a login shell, a
+		// current system generation. Repairing something in use needs
+		// the operator's explicit consent: without --fix-live, refuse.
+		// (The hash reconciliation below works for rooted and unrooted
+		// paths alike; the distinction is consent, not mechanism.)
+		reconcile := g.storePath != ""
 
 		// A content-addressed path's name IS a function of its bytes:
 		// repairing it would break the content address. Refusal class
@@ -345,19 +341,14 @@ func Run(args []string) int {
 			continue
 		}
 
-		// Make the database hash match the repaired bytes. For an
-		// unrooted path, export/delete/import is cleanest. For a rooted
-		// one (--fix-live), reconcile the hash row in place without
-		// deleting the path.
-		if reregister {
-			var regErr error
-			if fixLive {
-				regErr = store.ReconcileHash(g.storePath)
-			} else {
-				regErr = store.Reregister(g.storePath)
-			}
-			if regErr != nil {
-				fmt.Fprintf(os.Stderr, "fix: %s: %v\n", g.storePath, regErr)
+		// Make the database hash row match the repaired bytes:
+		// re-register validity with the recomputed NAR hash, in place.
+		// (export/delete/import is NOT usable here: `nix-store
+		// --export` verifies the recorded hash before streaming, so it
+		// always fails on a just-repaired path.)
+		if reconcile {
+			if err := store.ReconcileHash(g.storePath); err != nil {
+				fmt.Fprintf(os.Stderr, "fix: %s: %v\n", g.storePath, err)
 				fmt.Fprintf(os.Stderr, "      (files were repaired on disk but the recorded hash is now stale; `nix store verify` will report it)\n")
 				continue
 			}

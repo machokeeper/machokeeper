@@ -47,12 +47,14 @@ scope.
   renamed over the original, so an `auto-optimise-store` inode shared
   with other paths is never written through — only this path's directory
   entry is repointed.
-- Database coherence: an unrooted path is re-registered via
-  `nix-store --export | --delete | --import`, so its recorded NAR hash
-  matches the repaired bytes. A rooted path (only with `--fix-live`) has
-  its hash reconciled via `--register-validity --reregister`. In both
-  cases the path keeps its name; input-addressed store paths do not
-  depend on their contents.
+- Database coherence: after a repair the path's hash row is
+  reconciled in place via `--register-validity --reregister
+  --hash-given` with the recomputed NAR hash (export/delete/import is
+  not viable: `nix-store --export` verifies the recorded hash before
+  streaming, so it always refuses a just-repaired path). The path keeps
+  its name; input-addressed store paths do not depend on their
+  contents. Rooted paths additionally require `--fix-live` — the
+  distinction is operator consent to touch a live path, not mechanism.
 - Refusal classes: Developer-ID (CMS) signatures and content-addressed
   paths are reported, never written to.
 

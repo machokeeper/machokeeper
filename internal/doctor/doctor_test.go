@@ -18,9 +18,8 @@ type fakeStore struct {
 	rooted     map[string]bool   // store path -> has blockers
 	ca         map[string]bool   // store path -> content-addressed
 	failCA     bool              // IsContentAddressed returns an error
-	reregister []string
-	reconcile  []string
-	failReg    bool
+	reconcile  []string          // ReconcileHash calls
+	failReg    bool              // ReconcileHash returns an error
 }
 
 func (f *fakeStore) StorePathOf(file string) (string, bool) {
@@ -33,14 +32,10 @@ func (f *fakeStore) Blockers(sp string) ([]string, error) {
 	}
 	return nil, nil
 }
-func (f *fakeStore) Reregister(sp string) error {
+func (f *fakeStore) ReconcileHash(sp string) error {
 	if f.failReg {
 		return errReg
 	}
-	f.reregister = append(f.reregister, sp)
-	return nil
-}
-func (f *fakeStore) ReconcileHash(sp string) error {
 	f.reconcile = append(f.reconcile, sp)
 	return nil
 }
@@ -170,11 +165,8 @@ func TestDoctorFixStorePathReregisters(t *testing.T) {
 	if rc := Run([]string{"--quiet", "--fix", f}); rc != 0 {
 		t.Fatalf("rc = %d", rc)
 	}
-	if len(fs.reregister) != 1 || fs.reregister[0] != sp {
-		t.Errorf("Reregister calls = %v, want [%s]", fs.reregister, sp)
-	}
-	if len(fs.reconcile) != 0 {
-		t.Errorf("ReconcileHash should not be called for an unrooted path: %v", fs.reconcile)
+	if len(fs.reconcile) != 1 || fs.reconcile[0] != sp {
+		t.Errorf("ReconcileHash calls = %v, want [%s]", fs.reconcile, sp)
 	}
 }
 
@@ -197,8 +189,8 @@ func TestDoctorFixRootedPathSkippedWithoutFixLive(t *testing.T) {
 	if rc := Run([]string{"--quiet", "--fix", f}); rc != 2 {
 		t.Errorf("rooted --fix rc = %d, want 2", rc)
 	}
-	if len(fs.reregister)+len(fs.reconcile) != 0 {
-		t.Error("rooted path should not be re-registered under --fix")
+	if len(fs.reconcile) != 0 {
+		t.Error("rooted path should not be reconciled under --fix")
 	}
 	after, _ := os.ReadFile(f)
 	if !engine.Check(after, f) {
@@ -508,8 +500,8 @@ func TestDoctorFixRefusesContentAddressedPath(t *testing.T) {
 			t.Fatalf("%s modified a content-addressed path", flag)
 		}
 	}
-	if len(fs.reregister)+len(fs.reconcile) != 0 {
-		t.Error("CA path must not be re-registered or reconciled")
+	if len(fs.reconcile) != 0 {
+		t.Error("CA path must not be reconciled")
 	}
 }
 
@@ -711,8 +703,8 @@ func TestDoctorFixMultiFileGroupReregistersOnce(t *testing.T) {
 	if rc := Run([]string{"--quiet", "--fix", a, b, c}); rc != 0 {
 		t.Fatalf("rc = %d", rc)
 	}
-	if len(fs.reregister) != 1 || fs.reregister[0] != sp {
-		t.Errorf("Reregister calls = %v, want exactly one for %s", fs.reregister, sp)
+	if len(fs.reconcile) != 1 || fs.reconcile[0] != sp {
+		t.Errorf("ReconcileHash calls = %v, want exactly one for %s", fs.reconcile, sp)
 	}
 	for _, f := range []string{a, b, c} {
 		data, _ := os.ReadFile(f)
