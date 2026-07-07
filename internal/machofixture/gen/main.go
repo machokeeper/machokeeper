@@ -19,7 +19,7 @@ func main() {
 		os.Exit(1)
 	}
 	dir := os.Args[1]
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:gosec // fixture output dir must be world-readable inside the nix build sandbox
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
