@@ -45,16 +45,24 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     machine.wait_for_unit("multi-user.target")
 
-    # Place a broken (repairable) fixture into the store as a real,
-    # registered store path.
-    machine.succeed(
-        "mkdir -p /root/pkg/bin",
-        "cp ${fixtures}/repairable /root/pkg/bin/tool",
-        "chmod +x /root/pkg/bin/tool",
-    )
-    store_path = machine.succeed(
-        "nix-store --add /root/pkg"
-    ).strip()
+    # Build INPUT-addressed store paths carrying the fixtures: repair +
+    # re-registration is only legal for input addressing, and
+    # `nix-store --add` would produce a content-addressed path (that
+    # case gets its own refusal test below). Sandbox is off, so the
+    # builder can use /bin/sh.
+    def build_pkg(name, fixture, filename, out_link=None):
+        link = f"-o {out_link}" if out_link else "--no-out-link"
+        expr = (
+            "derivation { name = \"" + name + "\"; "
+            "system = builtins.currentSystem; "
+            "builder = \"/bin/sh\"; "
+            "args = [ \"-c\" \"mkdir -p $out/bin && "
+            "cp ${fixtures}/" + fixture + " $out/bin/" + filename + " && "
+            "chmod +x $out/bin/" + filename + "\" ]; }"
+        )
+        return machine.succeed(f"nix-build {link} --expr '{expr}'").strip().splitlines()[-1]
+
+    store_path = build_pkg("pkg", "repairable", "tool")
     print(f"store path: {store_path}")
 
     # check must see it as stale (exit 2, specifically).
@@ -80,15 +88,7 @@ pkgs.testers.runNixOSTest {
     machine.succeed(f"cd /root && machokeeper doctor --fix {store_path}")
 
     # ---- Rooted path: --fix must refuse, --fix-live must reconcile ----
-    machine.succeed(
-        "mkdir -p /root/pkg2/bin",
-        "cp ${fixtures}/repairable /root/pkg2/bin/tool2",
-        "chmod +x /root/pkg2/bin/tool2",
-    )
-    rooted = machine.succeed("nix-store --add /root/pkg2").strip()
-    machine.succeed(
-        f"nix-store --add-root /nix/var/nix/gcroots/keep-pkg2 --indirect --realise {rooted} || ln -s {rooted} /nix/var/nix/gcroots/keep-pkg2"
-    )
+    rooted = build_pkg("pkg2", "repairable", "tool2", out_link="/root/keep-pkg2")
     roots = machine.succeed(f"nix-store --query --roots {rooted}")
     assert "keep-pkg2" in roots, f"root not registered: {roots}"
 
@@ -104,17 +104,26 @@ pkgs.testers.runNixOSTest {
     machine.succeed("nix-store --verify --check-contents 2>&1 | tee /dev/stderr | (! grep -i 'differs\\|corrupt')")
 
     # ---- CMS: never touched, even with --fix ----
-    machine.succeed(
-        "mkdir -p /root/pkg3/bin",
-        "cp ${fixtures}/cms /root/pkg3/bin/devid",
-        "chmod +x /root/pkg3/bin/devid",
-    )
-    cms = machine.succeed("nix-store --add /root/pkg3").strip()
+    cms = build_pkg("pkg3", "cms", "devid")
     before = machine.succeed(f"sha256sum {cms}/bin/devid").split()[0]
     out = machine.succeed(f"cd /root && (machokeeper doctor --fix {cms} && echo rc=0 || echo rc=$?)")
     assert "rc=2" in out, f"CMS fix must exit 2: {out}"
     after = machine.succeed(f"sha256sum {cms}/bin/devid").split()[0]
     assert before == after, "CMS-signed file was modified"
+
+    # ---- Content-addressed path: refused, bytes untouched ----
+    # `nix-store --add` registers a CA path (text/fixed addressing):
+    # exactly the refusal class the CA guard exists for.
+    machine.succeed(
+        "mkdir -p /root/capkg/bin",
+        "cp ${fixtures}/repairable /root/capkg/bin/catool",
+        "chmod +x /root/capkg/bin/catool",
+    )
+    ca_path = machine.succeed("nix-store --add /root/capkg").strip()
+    out = machine.succeed(f"cd /root && (machokeeper doctor --fix {ca_path} && echo rc=0 || echo rc=$?)")
+    assert "rc=2" in out, f"CA fix must exit 2: {out}"
+    assert "content-addressed" in out, f"expected CA skip notice: {out}"
+    machine.fail(f"machokeeper check {ca_path}")  # still broken, untouched
 
     # ---- Whole-store scan finds nothing left broken ----
     out = machine.succeed(f"machokeeper doctor {cms} {store_path} {rooted} && echo rc=0 || echo rc=$?")
