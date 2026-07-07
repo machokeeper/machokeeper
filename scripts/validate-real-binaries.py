@@ -97,7 +97,9 @@ def extract(store_path, rel, workdir):
             # path's NAR, not the closure.
             subprocess.run(
                 ["nix", "store", "cat", "--store", CACHE, f"{store_path}/{rel}"],
-                check=True, stdout=f, timeout=300,
+                check=True,
+                stdout=f,
+                timeout=300,
             )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
@@ -121,7 +123,9 @@ def main():
 
     rows = fetch_csv(channel)
     repairable, devid = pick(rows, n)
-    print(f"{channel}: {len(rows)} broken slices; testing {len(repairable)} repairable + {len(devid)} Developer-ID")
+    print(
+        f"{channel}: {len(rows)} broken slices; testing {len(repairable)} repairable + {len(devid)} Developer-ID"
+    )
 
     checked = 0
     for r in repairable:
@@ -150,7 +154,9 @@ def main():
             os.chdir(wd)
             subprocess.run([mk, "doctor", "--fix", f], capture_output=True)
             if open(f, "rb").read() != before:
-                sys.exit(f"FAIL {os.path.basename(r['path'])}: Developer-ID file was modified")
+                sys.exit(
+                    f"FAIL {os.path.basename(r['path'])}: Developer-ID file was modified"
+                )
             print(f"PASS refuse  B7-real  {os.path.basename(r['path'])}")
             checked += 1
 

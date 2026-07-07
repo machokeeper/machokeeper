@@ -8,7 +8,9 @@ Thanks for helping keep Nix stores' Mach-O signatures valid.
 nix develop        # or: go 1.23+
 go test ./...      # unit + oracle cross-validation
 go test -race ./...
-nix flake check    # package + module eval
+nix fmt            # treefmt: gofmt, nixfmt, ruff, shfmt, yamlfmt
+nix flake check    # the full gate: build, tests + oracle, formatting,
+                   # lint, secrets scan, actionlint, nix hygiene
 ```
 
 Lint locally with `golangci-lint run` (config in `.golangci.yml`).
