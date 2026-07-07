@@ -71,6 +71,25 @@ jobs:
       - run: nix build .#default
       - run: ./result/bin/machokeeper help
 
+  # nix-daemon integration: a NixOS VM exercises the real store layer
+  # the unit tests fake — export/delete/import re-registration,
+  # --fix-live hash reconciliation on a GC-rooted path, blocker
+  # detection, CMS refusal and undo through the CLI on a live store.
+  vm-nixstore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+        with:
+          extra_nix_config: "experimental-features = nix-command flakes"
+      - run: nix build .#checks.x86_64-linux.vm-nixstore -L
+
   # Real-binary validation against cache.nixos.org: expensive and
   # network/cache-dependent, so it runs on schedule and on demand, not on
   # every PR. Fetches genuinely broken binaries named by the scope scanner
