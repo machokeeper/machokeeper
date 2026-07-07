@@ -104,20 +104,21 @@ func RegisterValidity(storePath, deriver, narHash string, narSize int64, referen
 }
 
 // registrationLines builds the stdin format `nix-store
-// --register-validity --hash-given` reads, per line group:
+// --register-validity --hash-given` reads, per line group — the same
+// field order `nix-store --dump-db` emits:
 //
 //	<store path>
+//	<narHash>            (with --hash-given: hash then size, before deriver)
+//	<narSize>
 //	<deriver or empty>
-//	<narHash>
-//	<narSize>            (with --hash-given)
 //	<#references>
 //	<reference>...       (one per line)
 func registrationLines(storePath, deriver, narHash string, narSize int64, references []string) string {
 	var b strings.Builder
 	fmt.Fprintln(&b, storePath)
-	fmt.Fprintln(&b, deriver)
 	fmt.Fprintln(&b, narHash)
 	fmt.Fprintln(&b, narSize)
+	fmt.Fprintln(&b, deriver)
 	fmt.Fprintln(&b, len(references))
 	for _, r := range references {
 		fmt.Fprintln(&b, r)

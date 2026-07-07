@@ -37,10 +37,12 @@ func TestRegistrationLines(t *testing.T) {
 		12345,
 		[]string{"/nix/store/ref1", "/nix/store/ref2"},
 	)
+	// Field order matches nix-store --dump-db: path, hash, size,
+	// deriver, then references.
 	want := "/nix/store/abc-pkg\n" +
-		"/nix/store/def-pkg.drv\n" +
 		"sha256:0131d5923zw1s2b5ij77ppks68hwjjlfgsc3mgd0j2dxw1lhd9n8\n" +
 		"12345\n" +
+		"/nix/store/def-pkg.drv\n" +
 		"2\n" +
 		"/nix/store/ref1\n" +
 		"/nix/store/ref2\n"
@@ -50,7 +52,7 @@ func TestRegistrationLines(t *testing.T) {
 	// No deriver, no references: empty deriver line, zero count, no
 	// reference lines.
 	got = registrationLines("/nix/store/abc-pkg", "", "sha256:x", 0, nil)
-	want = "/nix/store/abc-pkg\n\nsha256:x\n0\n0\n"
+	want = "/nix/store/abc-pkg\nsha256:x\n0\n\n0\n"
 	if got != want {
 		t.Errorf("registrationLines(empty):\ngot  %q\nwant %q", got, want)
 	}
