@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -194,6 +195,72 @@ func oversizedFinding(path string, size int64) *Finding {
 	}
 }
 
+// Scan resource tuning, set by Run from --jobs / --background so a
+// whole-store sweep is a good citizen. scanJobs == 0 means "auto".
+// background lowers process priority (see lowerPriority) and, per file,
+// drops scanned pages so the sweep does not evict the user's warm cache.
+var (
+	scanJobs   = 0
+	background = false
+)
+
+// lowerPriority puts this process into the OS background tier (see the
+// platform lowerPriorityImpl). Skipped when MACHOKEEPER_NO_LOWER_PRIORITY
+// is set, so the in-process test binary is never throttled.
+func lowerPriority() {
+	if os.Getenv("MACHOKEEPER_NO_LOWER_PRIORITY") == "" {
+		lowerPriorityImpl()
+	}
+}
+
+// applyScanFlags consumes the resource-tuning flags shared by doctor
+// and check — --background (lower priority + drop scanned pages) and
+// --jobs N (worker cap) — setting the package scan state, and returns
+// the remaining args. The module's hooks pass --background.
+func applyScanFlags(args []string) []string {
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--background":
+			background = true
+		case a == "--jobs":
+			if i+1 < len(args) {
+				i++
+				if n, err := strconv.Atoi(args[i]); err == nil && n > 0 {
+					scanJobs = n
+				}
+			}
+		case strings.HasPrefix(a, "--jobs="):
+			if n, err := strconv.Atoi(strings.TrimPrefix(a, "--jobs=")); err == nil && n > 0 {
+				scanJobs = n
+			}
+		default:
+			rest = append(rest, a)
+		}
+	}
+	return rest
+}
+
+// scanWorkers is the worker-pool size: an explicit --jobs, else half
+// the cores in background mode (leave headroom for interactive work),
+// else all cores for an interactive scan.
+func scanWorkers() int {
+	if scanJobs > 0 {
+		return scanJobs
+	}
+	n := runtime.NumCPU()
+	if background {
+		if n > 1 {
+			n /= 2
+		}
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
 // walkParallel scans a file or directory tree (symlinks never
 // followed) with the per-file scan fanned out over a worker pool: a
 // whole-store scan is dominated by reading and hashing file contents,
@@ -201,7 +268,7 @@ func oversizedFinding(path string, size int64) *Finding {
 // single-threaded; findings are delivered from a single goroutine, so
 // the visit callback needs no locking.
 func walkParallel(root string, visit func(*Finding)) error {
-	workers := runtime.NumCPU()
+	workers := scanWorkers()
 	files := make(chan string, workers*4)
 	results := make(chan *Finding, workers)
 
@@ -256,13 +323,15 @@ func walkParallel(root string, visit func(*Finding)) error {
 
 // Run implements `machokeeper doctor`.
 func Run(args []string) int {
+	background = false
+	scanJobs = 0
 	fix := false
 	fixLive := false
 	scan := false
 	quiet := false
 	jsonOut := false
 	var paths []string
-	for _, a := range args {
+	for _, a := range applyScanFlags(args) {
 		switch a {
 		case "--fix":
 			fix = true
@@ -286,6 +355,9 @@ func Run(args []string) int {
 	if len(paths) == 0 {
 		fmt.Fprintln(os.Stderr, "doctor: no paths given (use --scan for the whole store)")
 		return 1
+	}
+	if background {
+		lowerPriority()
 	}
 
 	say := func(format string, a ...any) {
@@ -700,6 +772,12 @@ func bytesEq(a, b []byte) bool {
 // unverifiable, 1 usage/IO error. Mirrors the exit contract of
 // `nix __fixup-macho --check` from the #15638 branch.
 func Check(args []string) int {
+	background = false
+	scanJobs = 0
+	args = applyScanFlags(args)
+	if background {
+		lowerPriority()
+	}
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "check: no paths given")
 		return 1

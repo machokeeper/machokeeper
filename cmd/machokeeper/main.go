@@ -19,6 +19,8 @@ const usage = `machokeeper — keep your Nix store's Mach-O binaries valid
 Usage:
   machokeeper doctor [--fix] PATH...   diagnose (and with --fix, repair) files or store paths
   machokeeper doctor --scan [--fix]    scan the whole local Nix store
+     [--jobs N]                        cap scan workers (default: all cores)
+     [--background]                    lower CPU/I/O priority; don't evict the page cache
   machokeeper doctor --fix-live PATH   also repair GC-rooted paths (e.g. a login shell) in place
   machokeeper doctor --scan --json     machine-readable findings (implies report-only)
   machokeeper check PATH...            exit 2 if any signature is stale or unverifiable

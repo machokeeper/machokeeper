@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -870,5 +871,56 @@ func TestWithGCLockAcquiresAndFallsBack(t *testing.T) {
 	_ = withGCLock(func() error { ran = true; return nil })
 	if !ran {
 		t.Fatal("fn must run when coordination is disabled")
+	}
+}
+
+func TestScanWorkersAndFlags(t *testing.T) {
+	defer func() { scanJobs = 0; background = false }()
+
+	// Explicit --jobs wins.
+	scanJobs, background = 0, false
+	rest := applyScanFlags([]string{"--jobs", "3", "/p"})
+	if scanJobs != 3 || scanWorkers() != 3 {
+		t.Errorf("--jobs 3: scanJobs=%d workers=%d", scanJobs, scanWorkers())
+	}
+	if len(rest) != 1 || rest[0] != "/p" {
+		t.Errorf("rest = %v, want [/p]", rest)
+	}
+
+	// --jobs=N form.
+	scanJobs, background = 0, false
+	applyScanFlags([]string{"--jobs=7"})
+	if scanJobs != 7 {
+		t.Errorf("--jobs=7: scanJobs=%d", scanJobs)
+	}
+
+	// Background halves the default; interactive uses all cores.
+	scanJobs, background = 0, true
+	bg := scanWorkers()
+	scanJobs, background = 0, false
+	full := scanWorkers()
+	if runtime.NumCPU() > 1 && bg >= full {
+		t.Errorf("background workers (%d) should be < interactive (%d)", bg, full)
+	}
+	if bg < 1 {
+		t.Errorf("background workers must be >= 1, got %d", bg)
+	}
+
+	// --background sets the flag; a bad --jobs is ignored (default).
+	scanJobs, background = 0, false
+	applyScanFlags([]string{"--background", "--jobs", "notanumber"})
+	if !background || scanJobs != 0 {
+		t.Errorf("background=%v scanJobs=%d, want true/0", background, scanJobs)
+	}
+}
+
+func TestBackgroundScanStillWorks(t *testing.T) {
+	// A background-mode scan finds the same broken files (the tuning is
+	// resource-only, not behavioral).
+	withStore(t, &fakeStore{})
+	dir := t.TempDir()
+	writeFixture(t, filepath.Join(dir, "broken"), machofixture.Repairable(2), engine.AdHoc, true)
+	if rc := Run([]string{"--quiet", "--background", "--jobs", "1", dir}); rc != 2 {
+		t.Errorf("background scan rc = %d, want 2", rc)
 	}
 }
