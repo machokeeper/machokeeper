@@ -114,13 +114,21 @@ What replaces a patrol: the one-shot first-enable sweep (repair what is
 already broken, once), and `doctor` on demand.
 
 The module's non-interactive scans (post-build hook, activation scan,
-first-enable sweep) run as a **good citizen**: `--background` lowers the
-process to the OS background tier (on darwin `PRIO_DARWIN_BG`, which
-throttles CPU *and* disk I/O; on Linux a nice-10 plus the idle I/O
-class), caps the worker pool at half the cores, and drops each scanned
-file's pages (`MADV_DONTNEED`) so a whole-store sweep does not evict the
-user's warm page cache. Interactive `doctor` stays at full speed; a
-manual scan can be tuned with `--jobs N` / `--background`.
+first-enable sweep) run as a **good citizen** under `--background`:
+
+- **Priority.** darwin `PRIO_DARWIN_BG` (throttles CPU *and* disk I/O);
+  Linux nice-10 plus the idle I/O-priority class.
+- **Parallelism.** the worker pool is capped at half the cores (leaving
+  headroom for interactive work); `--jobs N` sets it explicitly.
+- **Page cache.** on Linux each scanned file's clean pages are dropped
+  from the cache with `posix_fadvise(POSIX_FADV_DONTNEED)` after the
+  mapping is torn down, so a whole-store sweep does not evict the user's
+  warm cache. On darwin (no `posix_fadvise`) the read-only `MAP_SHARED`
+  mapping is the courtesy: its pages are clean, so the kernel reclaims
+  them ahead of the user's working set, and `PRIO_DARWIN_BG` throttles
+  the I/O rate.
+
+Interactive `doctor` stays at full speed.
 
 ## Store-write safety (GC and optimise)
 

@@ -124,6 +124,12 @@ func scanFile(path string) *Finding {
 		}
 		return nil
 	}
+	// In a background sweep, drop this file's pages from the cache once
+	// the mapping is gone. Deferred first so it runs AFTER unmap (LIFO)
+	// while the fd is still open (f.Close is the outermost defer).
+	if background {
+		defer dropScannedCache(f, size)
+	}
 	defer unmap()
 
 	kind := engine.Detect(data)
@@ -195,10 +201,17 @@ func oversizedFinding(path string, size int64) *Finding {
 	}
 }
 
-// Scan resource tuning, set by Run from --jobs / --background so a
+// Scan resource tuning, set by Run/Check from --jobs / --background so a
 // whole-store sweep is a good citizen. scanJobs == 0 means "auto".
 // background lowers process priority (see lowerPriority) and, per file,
 // drops scanned pages so the sweep does not evict the user's warm cache.
+//
+// These are process-global rather than threaded through every call
+// because machokeeper is a one-command-per-process CLI. The invariant
+// that keeps that safe: they are written only at the top of Run/Check,
+// before any worker goroutine is spawned, and are never mutated while a
+// scan is in flight (walkParallel joins all workers before returning).
+// Callers must not invoke Run/Check concurrently within one process.
 var (
 	scanJobs   = 0
 	background = false
@@ -225,15 +238,24 @@ func applyScanFlags(args []string) []string {
 		case a == "--background":
 			background = true
 		case a == "--jobs":
+			// Only consume the next arg when it is a positive number,
+			// so `doctor --jobs /nix/store/x` (number forgotten) does
+			// not silently swallow the path and scan nothing.
 			if i+1 < len(args) {
-				i++
-				if n, err := strconv.Atoi(args[i]); err == nil && n > 0 {
+				if n, err := strconv.Atoi(args[i+1]); err == nil && n > 0 {
 					scanJobs = n
+					i++
+				} else {
+					fmt.Fprintln(os.Stderr, "doctor: --jobs needs a positive number; ignoring")
 				}
+			} else {
+				fmt.Fprintln(os.Stderr, "doctor: --jobs needs a positive number; ignoring")
 			}
 		case strings.HasPrefix(a, "--jobs="):
 			if n, err := strconv.Atoi(strings.TrimPrefix(a, "--jobs=")); err == nil && n > 0 {
 				scanJobs = n
+			} else {
+				fmt.Fprintln(os.Stderr, "doctor: --jobs needs a positive number; ignoring")
 			}
 		default:
 			rest = append(rest, a)

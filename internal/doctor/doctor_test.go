@@ -924,3 +924,23 @@ func TestBackgroundScanStillWorks(t *testing.T) {
 		t.Errorf("background scan rc = %d, want 2", rc)
 	}
 }
+
+func TestJobsDoesNotSwallowPath(t *testing.T) {
+	defer func() { scanJobs = 0; background = false }()
+	// A non-number after --jobs must NOT be consumed (else a typo like
+	// `doctor --jobs /nix/store/x` silently drops the path).
+	scanJobs = 0
+	rest := applyScanFlags([]string{"--jobs", "/nix/store/x"})
+	if scanJobs != 0 {
+		t.Errorf("scanJobs = %d, want 0 (non-number ignored)", scanJobs)
+	}
+	if len(rest) != 1 || rest[0] != "/nix/store/x" {
+		t.Errorf("rest = %v, want [/nix/store/x] (path kept, not swallowed)", rest)
+	}
+	// --jobs as the final arg with no value: no panic, path list intact.
+	scanJobs = 0
+	rest = applyScanFlags([]string{"/p", "--jobs"})
+	if len(rest) != 1 || rest[0] != "/p" {
+		t.Errorf("rest = %v, want [/p]", rest)
+	}
+}
