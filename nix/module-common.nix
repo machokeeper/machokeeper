@@ -181,12 +181,15 @@ in
         lib.mkIf cfg.postBuildHook { nix.extraOptions = "post-build-hook = ${dispatcher}"; }
       )
 
+      # nix-darwin, unlike NixOS, has no generic activation-script dag: its
+      # `activate` splices only a fixed, enumerated set of script names
+      # (preActivation … postActivation). A custom `activationScripts.<name>`
+      # evaluates fine but is silently never run. So append into
+      # postActivation — which still runs before the current-system symlink
+      # flips — where `$systemConfig` is already in scope.
       ++ lib.optional (platform == "darwin") (
         lib.mkIf cfg.scanOnActivation {
-          system.activationScripts.machokeeper.text = ''
-            systemConfig="$systemConfig"
-            ${repairActivation}
-          '';
+          system.activationScripts.postActivation.text = lib.mkAfter repairActivation;
         }
       )
 
