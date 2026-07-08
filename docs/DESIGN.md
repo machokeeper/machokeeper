@@ -87,12 +87,31 @@ patch, and differ on exactly **one axis: pre-registration vs pre-use.**
   outside `wrap`, is the one case the inline patch catches that
   machokeeper does not unless the command was wrapped.
 
-A recurring maintenance timer was **considered and deliberately
-rejected** ("no daemons, no timers, no state"): a steady-state store is
-empty of new breakage between generations, so patrolling it on a
-schedule is wasted work and standing state. The one-shot first-enable
-sweep (repair what is already broken, once, recorded by a marker file)
-plus `doctor` on demand replace it.
+## No standing daemon
+
+There is deliberately **no long-lived machokeeper process** — no
+privileged `launchd` daemon, no `systemd` service, no periodic timer, no
+FSEvents store-watcher. The module wires only `activationScripts` (which
+run during a switch and exit) and the post-build hook (a short-lived
+child per build). Both a maintenance timer and a store-watcher were
+considered and cut. The reasons:
+
+- **It adds no coverage.** A steady-state store is empty of new breakage
+  between generations — every door that lets stale bytes in is already
+  guarded at the moment they enter. A patrol would run forever and find
+  nothing.
+- **It is the wrong security posture.** machokeeper parses
+  attacker-influenceable bytes only in short-lived, unprivileged
+  children, and mutates the store only on explicit consent (`--fix`,
+  enabling the module, a switch). A standing root daemon watching the
+  store and auto-repairing would be a long-lived privileged process
+  *continuously* parsing untrusted bytes — exactly the surface the
+  [threat model](../THREAT-MODEL.md) is built to avoid.
+- **It is standing state.** "No daemons, no timers, no state": the only
+  state is a first-enable marker file and the undo journals.
+
+What replaces a patrol: the one-shot first-enable sweep (repair what is
+already broken, once), and `doctor` on demand.
 
 ## Store-write safety (GC and optimise)
 
