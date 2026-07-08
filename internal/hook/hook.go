@@ -28,7 +28,9 @@ func PostBuild() int {
 	// --fix (not --fix-live): a freshly built output is not yet a GC
 	// root, so the re-registering path applies and keeps the hash
 	// correct. Quiet unless something is repaired.
-	args := append([]string{"--fix", "--quiet"}, outPaths...)
+	// --background: the module runs this off the interactive path, so
+	// yield CPU/I/O to the user and don't evict their page cache.
+	args := append([]string{"--fix", "--quiet", "--background"}, outPaths...)
 	doctor.Run(args)
 	return 0
 }
@@ -50,14 +52,14 @@ func ScanGeneration(newPath, oldPath, mode string) int {
 		return 0
 	}
 	if mode == "refuse" {
-		args := append([]string{}, delta...)
+		args := append([]string{"--background"}, delta...)
 		if rc := doctor.Check(args); rc == 2 {
 			fmt.Fprintln(os.Stderr, "machokeeper: refusing activation — the new generation contains broken Mach-O signatures (set services.machokeeper.onActivation = \"repair\" to fix them instead)")
 			return 1
 		}
 		return 0
 	}
-	args := append([]string{"--fix"}, delta...)
+	args := append([]string{"--fix", "--background"}, delta...)
 	doctor.Run(args)
 	return 0
 }
@@ -65,7 +67,7 @@ func ScanGeneration(newPath, oldPath, mode string) int {
 // Sweep implements `machokeeper sweep`: a one-shot repair of the whole
 // store, run once when the module is first enabled. Always exits 0.
 func Sweep() int {
-	doctor.Run([]string{"--scan", "--fix"})
+	doctor.Run([]string{"--scan", "--fix", "--background"})
 	return 0
 }
 

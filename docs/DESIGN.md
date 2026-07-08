@@ -113,6 +113,15 @@ considered and cut. The reasons:
 What replaces a patrol: the one-shot first-enable sweep (repair what is
 already broken, once), and `doctor` on demand.
 
+The module's non-interactive scans (post-build hook, activation scan,
+first-enable sweep) run as a **good citizen**: `--background` lowers the
+process to the OS background tier (on darwin `PRIO_DARWIN_BG`, which
+throttles CPU *and* disk I/O; on Linux a nice-10 plus the idle I/O
+class), caps the worker pool at half the cores, and drops each scanned
+file's pages (`MADV_DONTNEED`) so a whole-store sweep does not evict the
+user's warm page cache. Interactive `doctor` stays at full speed; a
+manual scan can be tuned with `--jobs N` / `--background`.
+
 ## Store-write safety (GC and optimise)
 
 The in-daemon patch repairs a path *before it is registered valid*,
