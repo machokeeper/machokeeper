@@ -173,11 +173,12 @@
                 touch $out
               '';
         }
-        # The nix-daemon integration test runs a NixOS VM: Linux-only,
-        # and needs KVM (CI's ubuntu runners have it; `nix build
-        # .#checks.x86_64-linux.vm-nixstore` locally on Linux).
+        # Linux-only checks: the NixOS VM nix-daemon integration test
+        # (needs KVM; CI's ubuntu runners have it) and the module
+        # post-build-hook auto-chaining eval (needs nixosSystem).
         // nixpkgs.lib.optionalAttrs (nixpkgs.lib.hasSuffix "-linux" system) {
           vm-nixstore = import ./nix/vm-test.nix { inherit pkgs self; };
+          module-autochain = import ./nix/module-test.nix { inherit pkgs self nixpkgs; };
         }
       );
 
