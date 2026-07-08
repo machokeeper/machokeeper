@@ -227,21 +227,20 @@ func (c scanConfig) workers() int {
 	return n
 }
 
-// lowerPriority puts this process into the OS background tier (see the
-// platform lowerPriorityImpl). Skipped when MACHOKEEPER_NO_LOWER_PRIORITY
+// lowerProcessPriority throttles the whole process where the OS supports
+// it process-wide (darwin: PRIO_DARWIN_BG). It is a no-op on Linux, where
+// scheduling is per-thread and each scan worker throttles its own thread
+// via lowerScanThread instead. Skipped when MACHOKEEPER_NO_LOWER_PRIORITY
 // is set, so the in-process test binary is never throttled.
-func lowerPriority() {
+func lowerProcessPriority() {
 	if os.Getenv("MACHOKEEPER_NO_LOWER_PRIORITY") == "" {
-		lowerPriorityImpl()
+		lowerProcessPriorityImpl()
 	}
 }
 
-// lowerScanThread lowers the priority of the calling worker's OS thread.
-// On Linux nice and the I/O class are per-thread, so a single
-// process-level lowerPriority (which only hits the main thread) does not
-// throttle the workers that do the scanning — each worker must lower its
-// own thread. lowerScanThreadImpl pins the thread on Linux; on darwin
-// PRIO_DARWIN_BG is already process-wide, so it is a no-op there.
+// lowerScanThread throttles the calling worker's OS thread (Linux:
+// SCHED_IDLE + idle I/O class on the pinned thread). No-op on darwin,
+// where lowerProcessPriority already covers every thread.
 func lowerScanThread() {
 	if os.Getenv("MACHOKEEPER_NO_LOWER_PRIORITY") == "" {
 		lowerScanThreadImpl()
@@ -387,7 +386,7 @@ func Run(args []string) int {
 		return 1
 	}
 	if cfg.background {
-		lowerPriority()
+		lowerProcessPriority()
 	}
 
 	say := func(format string, a ...any) {
@@ -804,7 +803,7 @@ func bytesEq(a, b []byte) bool {
 func Check(args []string) int {
 	cfg, paths := parseScanFlags(args)
 	if cfg.background {
-		lowerPriority()
+		lowerProcessPriority()
 	}
 	if len(paths) == 0 {
 		fmt.Fprintln(os.Stderr, "check: no paths given")
