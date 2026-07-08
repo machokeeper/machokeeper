@@ -65,9 +65,11 @@ and system-rebuild doors are guarded automatically — no daemon, no timer
 }
 ```
 
-- **`post-build-hook`** repairs locally built outputs before first use (the partial-store rewrite trigger). It chains any hook you already have — set `services.machokeeper.chainPostBuildHook = <your prior hook>;` (nix allows only one).
+- **`post-build-hook`** repairs locally built outputs before first use (the partial-store rewrite trigger). Nix allows only one post-build-hook, so machokeeper **auto-detects and chains** any existing `nix.settings.post-build-hook` (e.g. a cachix push hook) — you change nothing but `enable`. Add further hooks with `services.machokeeper.extraPostBuildHooks = [ … ];`.
 - **Activation scan** repairs the new generation's store paths during `darwin-rebuild switch` / `nixos-rebuild switch`, after substitution and before the generation goes live — so a broken `fish` never becomes your login shell. Set `services.machokeeper.onActivation = "refuse";` to fail the switch instead of repairing.
 - **First-enable sweep** repairs anything already broken in the store, once.
+
+On **home-manager** the module installs the CLI and, on activation, scans your profile read-only and warns if anything is broken — repair itself needs write access to the store, so use the nix-darwin/NixOS module (or `sudo machokeeper doctor --fix`). `post-build-hook` is a trusted daemon-side setting a user-level nix.conf can't set on a multi-user install, so it's wired by the system module, not home-manager.
 
 ## Ad-hoc commands (wrap)
 

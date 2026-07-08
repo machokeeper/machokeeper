@@ -88,6 +88,8 @@ jobs:
       - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
         with:
           extra_nix_config: "experimental-features = nix-command flakes"
+      - name: Module post-build-hook auto-chaining (nixosSystem eval)
+        run: nix build .#checks.x86_64-linux.module-autochain -L
       - run: nix build .#checks.x86_64-linux.vm-nixstore -L
 
   # Real-binary validation against cache.nixos.org: expensive and
