@@ -92,8 +92,8 @@ type journalEntry struct {
 }
 
 // scanFile inspects one regular file; returns nil if healthy or not a
-// signed Mach-O.
-func scanFile(path string) *Finding {
+// signed Mach-O. cfg.background enables the page-cache drop.
+func scanFile(path string, cfg scanConfig) *Finding {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil
@@ -127,7 +127,7 @@ func scanFile(path string) *Finding {
 	// In a background sweep, drop this file's pages from the cache once
 	// the mapping is gone. Deferred first so it runs AFTER unmap (LIFO)
 	// while the fd is still open (f.Close is the outermost defer).
-	if background {
+	if cfg.background {
 		defer dropScannedCache(f, size)
 	}
 	defer unmap()
@@ -201,21 +201,31 @@ func oversizedFinding(path string, size int64) *Finding {
 	}
 }
 
-// Scan resource tuning, set by Run/Check from --jobs / --background so a
-// whole-store sweep is a good citizen. scanJobs == 0 means "auto".
-// background lowers process priority (see lowerPriority) and, per file,
-// drops scanned pages so the sweep does not evict the user's warm cache.
-//
-// These are process-global rather than threaded through every call
-// because machokeeper is a one-command-per-process CLI. The invariant
-// that keeps that safe: they are written only at the top of Run/Check,
-// before any worker goroutine is spawned, and are never mutated while a
-// scan is in flight (walkParallel joins all workers before returning).
-// Callers must not invoke Run/Check concurrently within one process.
-var (
-	scanJobs   = 0
-	background = false
-)
+// scanConfig is the resource-tuning for one scan, parsed from --jobs /
+// --background and threaded through walkParallel and scanFile — no
+// process-global state, so nothing races if callers ever run scans
+// concurrently. jobs == 0 means "auto".
+type scanConfig struct {
+	jobs       int
+	background bool
+}
+
+// workers is the worker-pool size: an explicit --jobs, else half the
+// cores in background mode (leave headroom for interactive work), else
+// all cores for an interactive scan. Never returns < 1.
+func (c scanConfig) workers() int {
+	if c.jobs > 0 {
+		return c.jobs
+	}
+	n := runtime.NumCPU()
+	if c.background && n > 1 {
+		n /= 2
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
 
 // lowerPriority puts this process into the OS background tier (see the
 // platform lowerPriorityImpl). Skipped when MACHOKEEPER_NO_LOWER_PRIORITY
@@ -226,24 +236,36 @@ func lowerPriority() {
 	}
 }
 
-// applyScanFlags consumes the resource-tuning flags shared by doctor
-// and check — --background (lower priority + drop scanned pages) and
-// --jobs N (worker cap) — setting the package scan state, and returns
+// lowerScanThread lowers the priority of the calling worker's OS thread.
+// On Linux nice and the I/O class are per-thread, so a single
+// process-level lowerPriority (which only hits the main thread) does not
+// throttle the workers that do the scanning — each worker must lower its
+// own thread. lowerScanThreadImpl pins the thread on Linux; on darwin
+// PRIO_DARWIN_BG is already process-wide, so it is a no-op there.
+func lowerScanThread() {
+	if os.Getenv("MACHOKEEPER_NO_LOWER_PRIORITY") == "" {
+		lowerScanThreadImpl()
+	}
+}
+
+// parseScanFlags consumes the resource-tuning flags shared by doctor and
+// check — --background and --jobs N / --jobs=N — returning the config and
 // the remaining args. The module's hooks pass --background.
-func applyScanFlags(args []string) []string {
+func parseScanFlags(args []string) (scanConfig, []string) {
+	var cfg scanConfig
 	var rest []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
 		case a == "--background":
-			background = true
+			cfg.background = true
 		case a == "--jobs":
 			// Only consume the next arg when it is a positive number,
 			// so `doctor --jobs /nix/store/x` (number forgotten) does
 			// not silently swallow the path and scan nothing.
 			if i+1 < len(args) {
 				if n, err := strconv.Atoi(args[i+1]); err == nil && n > 0 {
-					scanJobs = n
+					cfg.jobs = n
 					i++
 				} else {
 					fmt.Fprintln(os.Stderr, "doctor: --jobs needs a positive number; ignoring")
@@ -253,7 +275,7 @@ func applyScanFlags(args []string) []string {
 			}
 		case strings.HasPrefix(a, "--jobs="):
 			if n, err := strconv.Atoi(strings.TrimPrefix(a, "--jobs=")); err == nil && n > 0 {
-				scanJobs = n
+				cfg.jobs = n
 			} else {
 				fmt.Fprintln(os.Stderr, "doctor: --jobs needs a positive number; ignoring")
 			}
@@ -261,26 +283,7 @@ func applyScanFlags(args []string) []string {
 			rest = append(rest, a)
 		}
 	}
-	return rest
-}
-
-// scanWorkers is the worker-pool size: an explicit --jobs, else half
-// the cores in background mode (leave headroom for interactive work),
-// else all cores for an interactive scan.
-func scanWorkers() int {
-	if scanJobs > 0 {
-		return scanJobs
-	}
-	n := runtime.NumCPU()
-	if background {
-		if n > 1 {
-			n /= 2
-		}
-	}
-	if n < 1 {
-		n = 1
-	}
-	return n
+	return cfg, rest
 }
 
 // walkParallel scans a file or directory tree (symlinks never
@@ -289,8 +292,8 @@ func scanWorkers() int {
 // which parallelises cleanly. Directory traversal stays
 // single-threaded; findings are delivered from a single goroutine, so
 // the visit callback needs no locking.
-func walkParallel(root string, visit func(*Finding)) error {
-	workers := scanWorkers()
+func walkParallel(root string, cfg scanConfig, visit func(*Finding)) error {
+	workers := cfg.workers()
 	files := make(chan string, workers*4)
 	results := make(chan *Finding, workers)
 
@@ -299,8 +302,14 @@ func walkParallel(root string, visit func(*Finding)) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// Each worker lowers its own OS thread's priority: on Linux
+			// nice/ioprio are per-thread, so the process-level call in
+			// Run only covers the main thread, not these workers.
+			if cfg.background {
+				lowerScanThread()
+			}
 			for p := range files {
-				if f := scanFile(p); f != nil {
+				if f := scanFile(p, cfg); f != nil {
 					results <- f
 				}
 			}
@@ -345,15 +354,14 @@ func walkParallel(root string, visit func(*Finding)) error {
 
 // Run implements `machokeeper doctor`.
 func Run(args []string) int {
-	background = false
-	scanJobs = 0
+	cfg, rest := parseScanFlags(args)
 	fix := false
 	fixLive := false
 	scan := false
 	quiet := false
 	jsonOut := false
 	var paths []string
-	for _, a := range applyScanFlags(args) {
+	for _, a := range rest {
 		switch a {
 		case "--fix":
 			fix = true
@@ -378,7 +386,7 @@ func Run(args []string) int {
 		fmt.Fprintln(os.Stderr, "doctor: no paths given (use --scan for the whole store)")
 		return 1
 	}
-	if background {
+	if cfg.background {
 		lowerPriority()
 	}
 
@@ -390,7 +398,7 @@ func Run(args []string) int {
 
 	var findings []*Finding
 	for _, p := range paths {
-		if err := walkParallel(p, func(f *Finding) { findings = append(findings, f) }); err != nil {
+		if err := walkParallel(p, cfg, func(f *Finding) { findings = append(findings, f) }); err != nil {
 			fmt.Fprintf(os.Stderr, "doctor: %s: %v\n", p, err)
 		}
 	}
@@ -794,19 +802,17 @@ func bytesEq(a, b []byte) bool {
 // unverifiable, 1 usage/IO error. Mirrors the exit contract of
 // `nix __fixup-macho --check` from the #15638 branch.
 func Check(args []string) int {
-	background = false
-	scanJobs = 0
-	args = applyScanFlags(args)
-	if background {
+	cfg, paths := parseScanFlags(args)
+	if cfg.background {
 		lowerPriority()
 	}
-	if len(args) == 0 {
+	if len(paths) == 0 {
 		fmt.Fprintln(os.Stderr, "check: no paths given")
 		return 1
 	}
 	stale := 0
-	for _, p := range args {
-		if err := walkParallel(p, func(f *Finding) { stale++ }); err != nil {
+	for _, p := range paths {
+		if err := walkParallel(p, cfg, func(f *Finding) { stale++ }); err != nil {
 			fmt.Fprintf(os.Stderr, "check: %s: %v\n", p, err)
 			return 1
 		}

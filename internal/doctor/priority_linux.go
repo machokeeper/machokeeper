@@ -2,7 +2,21 @@
 
 package doctor
 
-import "syscall"
+import (
+	"runtime"
+	"syscall"
+)
+
+// lowerScanThreadImpl pins the calling worker to its OS thread and lowers
+// that thread's nice / I/O class. nice and ioprio are per-thread on
+// Linux, so a process-level call only throttles the main thread — each
+// scan worker must lower its own. The thread stays pinned for the
+// worker's life (fine; the worker just loops over the file channel) and
+// is retired when the goroutine ends.
+func lowerScanThreadImpl() {
+	runtime.LockOSThread()
+	lowerPriorityImpl()
+}
 
 // lowerPriority makes a background scan yield to interactive work: a
 // +10 nice for CPU, and the idle I/O-priority class for disk (effective

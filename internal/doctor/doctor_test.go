@@ -343,7 +343,7 @@ func TestWalkParallelFindsAllBroken(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "valid.dylib"), valid, 0o644)
 
 	var count int
-	if err := walkParallel(dir, func(*Finding) { count++ }); err != nil {
+	if err := walkParallel(dir, scanConfig{}, func(*Finding) { count++ }); err != nil {
 		t.Fatal(err)
 	}
 	if count != nBroken {
@@ -629,13 +629,13 @@ func TestWalkParallelSingleFileAndError(t *testing.T) {
 	writeFixture(t, f, machofixture.Repairable(2), engine.AdHoc, true)
 
 	var count int
-	if err := walkParallel(f, func(*Finding) { count++ }); err != nil {
+	if err := walkParallel(f, scanConfig{}, func(*Finding) { count++ }); err != nil {
 		t.Fatal(err)
 	}
 	if count != 1 {
 		t.Errorf("single-file walk found %d, want 1", count)
 	}
-	if err := walkParallel(filepath.Join(dir, "nonexistent"), func(*Finding) {}); err == nil {
+	if err := walkParallel(filepath.Join(dir, "nonexistent"), scanConfig{}, func(*Finding) {}); err == nil {
 		t.Error("nonexistent root must return an error")
 	}
 }
@@ -645,7 +645,7 @@ func TestScanFileEdgeCases(t *testing.T) {
 	// Shorter than the magic.
 	tiny := filepath.Join(dir, "tiny")
 	os.WriteFile(tiny, []byte{0xfe, 0xed}, 0o644)
-	if f := scanFile(tiny); f != nil {
+	if f := scanFile(tiny, scanConfig{}); f != nil {
 		t.Errorf("tiny file: %+v", f)
 	}
 	// Magic but nothing else: Detect must say None.
@@ -653,7 +653,7 @@ func TestScanFileEdgeCases(t *testing.T) {
 	blob := make([]byte, 16)
 	blob[0], blob[1], blob[2], blob[3] = 0xcf, 0xfa, 0xed, 0xfe // MH_MAGIC_64 LE
 	os.WriteFile(magicOnly, blob, 0o644)
-	if f := scanFile(magicOnly); f != nil {
+	if f := scanFile(magicOnly, scanConfig{}); f != nil {
 		t.Errorf("magic-only file: %+v", f)
 	}
 	// Valid signed file: healthy, no finding.
@@ -661,7 +661,7 @@ func TestScanFileEdgeCases(t *testing.T) {
 	engine.Repair(valid, "x")
 	good := filepath.Join(dir, "good")
 	os.WriteFile(good, valid, 0o644)
-	if f := scanFile(good); f != nil {
+	if f := scanFile(good, scanConfig{}); f != nil {
 		t.Errorf("healthy file: %+v", f)
 	}
 }
@@ -749,7 +749,7 @@ func TestScanFileOversizedIsUnverifiableFailClosed(t *testing.T) {
 	if err := os.WriteFile(f, blob, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	fnd := scanFile(f)
+	fnd := scanFile(f, scanConfig{})
 	if fnd == nil {
 		t.Fatal("oversized Mach-O must be reported, not skipped")
 	}
@@ -786,14 +786,14 @@ func TestScanFileSubCapStillVerified(t *testing.T) {
 	dir := t.TempDir()
 	broken := filepath.Join(dir, "broken")
 	os.WriteFile(broken, machofixture.Repairable(2), 0o644)
-	if fnd := scanFile(broken); fnd == nil || !fnd.Repairable {
+	if fnd := scanFile(broken, scanConfig{}); fnd == nil || !fnd.Repairable {
 		t.Fatalf("sub-cap broken file must be a repairable finding: %+v", fnd)
 	}
 	valid := machofixture.Repairable(2)
 	engine.Repair(valid, "x")
 	good := filepath.Join(dir, "good")
 	os.WriteFile(good, valid, 0o644)
-	if fnd := scanFile(good); fnd != nil {
+	if fnd := scanFile(good, scanConfig{}); fnd != nil {
 		t.Errorf("sub-cap valid file must be healthy: %+v", fnd)
 	}
 }
@@ -811,7 +811,7 @@ func TestReadForScanFallbackWhenTooLargeToLoad(t *testing.T) {
 	os.WriteFile(f, machofixture.Repairable(2), 0o644)
 	// On unix mmap succeeds, so the file is still scanned (a finding).
 	// The assertion is only that scanFile does not panic or misbehave.
-	_ = scanFile(f)
+	_ = scanFile(f, scanConfig{})
 }
 
 func TestWithGCLockAcquiresAndFallsBack(t *testing.T) {
@@ -875,30 +875,24 @@ func TestWithGCLockAcquiresAndFallsBack(t *testing.T) {
 }
 
 func TestScanWorkersAndFlags(t *testing.T) {
-	defer func() { scanJobs = 0; background = false }()
-
 	// Explicit --jobs wins.
-	scanJobs, background = 0, false
-	rest := applyScanFlags([]string{"--jobs", "3", "/p"})
-	if scanJobs != 3 || scanWorkers() != 3 {
-		t.Errorf("--jobs 3: scanJobs=%d workers=%d", scanJobs, scanWorkers())
+	cfg, rest := parseScanFlags([]string{"--jobs", "3", "/p"})
+	if cfg.jobs != 3 || cfg.workers() != 3 {
+		t.Errorf("--jobs 3: jobs=%d workers=%d", cfg.jobs, cfg.workers())
 	}
 	if len(rest) != 1 || rest[0] != "/p" {
 		t.Errorf("rest = %v, want [/p]", rest)
 	}
 
 	// --jobs=N form.
-	scanJobs, background = 0, false
-	applyScanFlags([]string{"--jobs=7"})
-	if scanJobs != 7 {
-		t.Errorf("--jobs=7: scanJobs=%d", scanJobs)
+	cfg, _ = parseScanFlags([]string{"--jobs=7"})
+	if cfg.jobs != 7 {
+		t.Errorf("--jobs=7: jobs=%d", cfg.jobs)
 	}
 
 	// Background halves the default; interactive uses all cores.
-	scanJobs, background = 0, true
-	bg := scanWorkers()
-	scanJobs, background = 0, false
-	full := scanWorkers()
+	bg := scanConfig{background: true}.workers()
+	full := scanConfig{}.workers()
 	if runtime.NumCPU() > 1 && bg >= full {
 		t.Errorf("background workers (%d) should be < interactive (%d)", bg, full)
 	}
@@ -907,10 +901,9 @@ func TestScanWorkersAndFlags(t *testing.T) {
 	}
 
 	// --background sets the flag; a bad --jobs is ignored (default).
-	scanJobs, background = 0, false
-	applyScanFlags([]string{"--background", "--jobs", "notanumber"})
-	if !background || scanJobs != 0 {
-		t.Errorf("background=%v scanJobs=%d, want true/0", background, scanJobs)
+	cfg, _ = parseScanFlags([]string{"--background", "--jobs", "notanumber"})
+	if !cfg.background || cfg.jobs != 0 {
+		t.Errorf("background=%v jobs=%d, want true/0", cfg.background, cfg.jobs)
 	}
 }
 
@@ -926,20 +919,17 @@ func TestBackgroundScanStillWorks(t *testing.T) {
 }
 
 func TestJobsDoesNotSwallowPath(t *testing.T) {
-	defer func() { scanJobs = 0; background = false }()
 	// A non-number after --jobs must NOT be consumed (else a typo like
 	// `doctor --jobs /nix/store/x` silently drops the path).
-	scanJobs = 0
-	rest := applyScanFlags([]string{"--jobs", "/nix/store/x"})
-	if scanJobs != 0 {
-		t.Errorf("scanJobs = %d, want 0 (non-number ignored)", scanJobs)
+	cfg, rest := parseScanFlags([]string{"--jobs", "/nix/store/x"})
+	if cfg.jobs != 0 {
+		t.Errorf("jobs = %d, want 0 (non-number ignored)", cfg.jobs)
 	}
 	if len(rest) != 1 || rest[0] != "/nix/store/x" {
 		t.Errorf("rest = %v, want [/nix/store/x] (path kept, not swallowed)", rest)
 	}
 	// --jobs as the final arg with no value: no panic, path list intact.
-	scanJobs = 0
-	rest = applyScanFlags([]string{"/p", "--jobs"})
+	_, rest = parseScanFlags([]string{"/p", "--jobs"})
 	if len(rest) != 1 || rest[0] != "/p" {
 		t.Errorf("rest = %v, want [/p]", rest)
 	}

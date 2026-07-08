@@ -17,3 +17,7 @@ const (
 func lowerPriorityImpl() {
 	_ = syscall.Setpriority(prioDarwinProcess, 0, prioDarwinBG)
 }
+
+// lowerScanThreadImpl is a no-op on darwin: PRIO_DARWIN_BG set by
+// lowerPriorityImpl is process-wide, so the workers are already throttled.
+func lowerScanThreadImpl() {}
