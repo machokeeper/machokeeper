@@ -7,6 +7,15 @@
       url = "github:numtide/treefmt-nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Used only by the darwin-only activation eval check (below): nix-darwin
+    # has no generic activation-script dag, so the module must land its scan
+    # in a slot `activate` actually splices. The check builds a darwinSystem
+    # and asserts the snippet is present. Not a runtime dependency of the
+    # module — consumers supply their own nix-darwin.
+    nix-darwin = {
+      url = "github:nix-darwin/nix-darwin";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -14,6 +23,7 @@
       self,
       nixpkgs,
       treefmt-nix,
+      nix-darwin,
     }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [
@@ -179,6 +189,18 @@
         // nixpkgs.lib.optionalAttrs (nixpkgs.lib.hasSuffix "-linux" system) {
           vm-nixstore = import ./nix/vm-test.nix { inherit pkgs self; };
           module-autochain = import ./nix/module-test.nix { inherit pkgs self nixpkgs; };
+        }
+        # Darwin-only: prove the activation scan/sweep lands in nix-darwin's
+        # `activate` (which splices only a fixed set of script names).
+        // nixpkgs.lib.optionalAttrs (nixpkgs.lib.hasSuffix "-darwin" system) {
+          module-darwin-activation = import ./nix/module-darwin-test.nix {
+            inherit
+              pkgs
+              self
+              nix-darwin
+              system
+              ;
+          };
         }
       );
 
