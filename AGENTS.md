@@ -6,7 +6,10 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) (invariants, engine change rules) and
 [THREAT-MODEL.md](THREAT-MODEL.md) before touching `engine/` or anything that
 writes to a store. [docs/DESIGN.md](docs/DESIGN.md) has the "doors" model —
 which mechanism (post-build hook, activation scan, `wrap`, doctor/sweep)
-guards each way stale bytes enter a store, and why it's out-of-band.
+guards each way stale bytes enter a store, and why it's out-of-band. Before
+reviewing a diff, read [docs/REVIEWING.md](docs/REVIEWING.md) (severity
+calibration + danger zones); accepted tradeoffs are the cite-by-ID register in
+[docs/RESIDUALS.md](docs/RESIDUALS.md).
 
 ## Commands
 
