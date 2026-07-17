@@ -70,6 +70,9 @@ and the mechanism guarding each — see [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Residual risks (accepted, documented)
 
+Indexed cite-by-ID (R-001–R-004) in [docs/RESIDUALS.md](docs/RESIDUALS.md), so
+a review can cite a settled tradeoff instead of re-litigating it.
+
 - **A repaired path diverges from the cache.** `nix store verify`
   against the substituter will report a hash mismatch for a repaired
   path, and `nix store verify --repair` would restore the broken cached
