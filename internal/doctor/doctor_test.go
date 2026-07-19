@@ -90,6 +90,42 @@ func writeFixture(t *testing.T, path string, blob []byte, wantKind engine.Kind, 
 	}
 }
 
+// TestPlanFileRepairVerifiesBeforeWrite pins the repair FSM: planFileRepair
+// re-verifies in memory and yields a verifiedRepair token while writing
+// NOTHING to disk; only writeRepair (which requires the token) commits. So an
+// unverified repair can never reach disk — it is unrepresentable, not merely
+// guarded by call ordering.
+func TestPlanFileRepairVerifiesBeforeWrite(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "broken")
+	writeFixture(t, f, machofixture.Repairable(2), engine.AdHoc, true)
+
+	// Plan: yields a verified token with changes, but does NOT touch disk.
+	vr, err := planFileRepair(f)
+	if err != nil {
+		t.Fatalf("planFileRepair: %v", err)
+	}
+	if len(vr.changes) == 0 {
+		t.Fatal("planFileRepair returned no changes for a repairable file")
+	}
+	if onDisk, _ := os.ReadFile(f); !engine.Check(onDisk, f) {
+		t.Fatal("planFileRepair wrote to disk (file no longer stale); it must decide, not apply")
+	}
+
+	// Apply: only writeRepair commits the verified bytes.
+	if err := writeRepair(vr); err != nil {
+		t.Fatalf("writeRepair: %v", err)
+	}
+	if onDisk, _ := os.ReadFile(f); engine.Check(onDisk, f) {
+		t.Fatal("writeRepair did not leave the file valid")
+	}
+
+	// A now-valid file yields no token (and thus no possible write).
+	if _, err := planFileRepair(f); err == nil {
+		t.Fatal("planFileRepair on a valid file returned a token; want an error (nothing to repair)")
+	}
+}
+
 func TestDoctorDetectReportsRepairableAndUnrepairable(t *testing.T) {
 	withStore(t, &fakeStore{})
 	dir := t.TempDir()
@@ -752,6 +788,7 @@ func TestScanFileOversizedIsUnverifiableFailClosed(t *testing.T) {
 	fnd := scanFile(f, scanConfig{})
 	if fnd == nil {
 		t.Fatal("oversized Mach-O must be reported, not skipped")
+		return // unreachable (t.Fatal halts); silences a golangci-lint 2.12.x SA5011 false positive
 	}
 	if fnd.Repairable {
 		t.Error("oversized file must never be repairable")
