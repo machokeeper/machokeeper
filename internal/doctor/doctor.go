@@ -133,8 +133,11 @@ func scanFile(path string, cfg scanConfig) *Finding {
 	defer unmap()
 
 	kind := engine.Detect(data)
-	if kind == engine.None {
-		return nil
+	switch kind {
+	case engine.None:
+		return nil // unsigned — nothing to verify or repair
+	case engine.AdHoc, engine.CMS:
+		// signed — verify below. (exhaustive: a new Kind must be handled here.)
 	}
 	if !engine.Check(data, path) {
 		return nil // signed and valid
@@ -144,13 +147,17 @@ func scanFile(path string, cfg scanConfig) *Finding {
 	// the signature class. An ad-hoc file whose signature is stale
 	// because it is UNVERIFIABLE (malformed CodeDirectory, unsupported
 	// hash type) has nothing repair can rewrite and must be reported
-	// unrepairable, not queued for a fix that will no-op.
+	// unrepairable, not queued for a fix that will no-op. CMS and any
+	// future class are never repairable — unknown stays broken.
 	repairable := false
-	if kind == engine.AdHoc {
+	switch kind {
+	case engine.AdHoc:
 		trial := append([]byte(nil), data...)
 		if _, modified, err := engine.Repair(trial, path); err == nil && modified && !engine.Check(trial, path) {
 			repairable = true
 		}
+	case engine.None, engine.CMS:
+		// None cannot reach here; CMS needs the signer, so never repairable.
 	}
 	class := kind.String()
 	if kind == engine.AdHoc && !repairable {
@@ -646,32 +653,65 @@ func storePathBlockers(storePath string) ([]string, error) {
 	return append(roots, refs...), nil
 }
 
-// repairFileHardlinkSafe repairs one signed Mach-O file. It writes the
-// repaired bytes to a sibling temp file and renames it over the
-// original, so a file shared by `auto-optimise-store` hardlinks is not
-// corrupted through those other names — only this directory entry is
-// repointed at a fresh inode. The repair is re-verified before the
-// rename; only stale hash slots are ever changed.
-func repairFileHardlinkSafe(path string) ([]engine.Change, error) {
+// verifiedRepair is a repair that has been computed AND re-verified in memory
+// (the repaired bytes pass engine.Check). It is the only input writeRepair
+// accepts. planFileRepair is its sole producer, and it constructs one only
+// after re-verification passes — so the "re-verify before it counts" transition
+// is enforced by that single-producer discipline rather than by call ordering.
+// (Within this package a literal verifiedRepair{...} could still be built; the
+// guarantee is the discipline, plus the unexported fields, which make it
+// unforgeable from outside the package.)
+type verifiedRepair struct {
+	path    string
+	data    []byte // the repaired, re-verified bytes
+	changes []engine.Change
+}
+
+// planFileRepair is the pure "decide" half: read path, repair in memory, and
+// re-verify. It writes NOTHING. It yields a verifiedRepair only when the
+// repaired bytes pass verification; otherwise an error and no token.
+func planFileRepair(path string) (verifiedRepair, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return verifiedRepair{}, err
 	}
 	changes, modified, err := engine.Repair(data, path)
 	if err != nil {
-		return nil, err
+		return verifiedRepair{}, err
 	}
 	if !modified {
-		return nil, fmt.Errorf("nothing to repair")
+		return verifiedRepair{}, fmt.Errorf("nothing to repair")
 	}
-	// Never trust our own repair: re-verify before writing.
+	// Never trust our own repair: re-verify before it can become a
+	// verifiedRepair (engine.Check == true means still stale).
 	if engine.Check(data, path) {
-		return nil, fmt.Errorf("still fails verification after repair; not writing")
+		return verifiedRepair{}, fmt.Errorf("still fails verification after repair; not writing")
 	}
-	if err := replaceFile(path, data); err != nil {
+	return verifiedRepair{path: path, data: data, changes: changes}, nil
+}
+
+// writeRepair is the effectful "apply" half: commit a verifiedRepair to disk.
+// It accepts only the token, so the bytes it writes are the ones planFileRepair
+// re-verified. The write is hardlink-safe (temp file + rename, via replaceFile).
+func writeRepair(vr verifiedRepair) error {
+	return replaceFile(vr.path, vr.data)
+}
+
+// repairFileHardlinkSafe reads, repairs, re-verifies, and writes one file,
+// returning the applied changes. The verify→write transition is gated by the
+// verifiedRepair token (planFileRepair → writeRepair); the write is
+// hardlink-safe (temp file + rename, via replaceFile), so a file shared by
+// `auto-optimise-store` hardlinks is repointed at a fresh inode rather than
+// corrupted in place through those other names.
+func repairFileHardlinkSafe(path string) ([]engine.Change, error) {
+	vr, err := planFileRepair(path)
+	if err != nil {
 		return nil, err
 	}
-	return changes, nil
+	if err := writeRepair(vr); err != nil {
+		return nil, err
+	}
+	return vr.changes, nil
 }
 
 // replaceFile writes data to a sibling temp file and renames it over

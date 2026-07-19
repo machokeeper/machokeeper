@@ -84,12 +84,14 @@ const (
 
 func (k Kind) String() string {
 	switch k {
+	case None:
+		return "unsigned"
 	case AdHoc:
 		return "ad-hoc"
 	case CMS:
 		return "CMS (Developer ID)"
 	default:
-		return "unsigned"
+		return "unsigned" // an out-of-range Kind value
 	}
 }
 

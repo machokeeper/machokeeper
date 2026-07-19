@@ -11,7 +11,15 @@ linters:
     - misspell
     - unconvert
     - bodyclose
+    - exhaustive
   settings:
+    exhaustive:
+      # Every switch on the Kind signature-class enum must handle every
+      # member. A `default` clause does NOT excuse an unlisted member: adding
+      # a new signature Kind must fail the lint until each decision site
+      # handles it, hard-wiring the "unknown/unparseable class = broken,
+      # never waved through" invariant (AGENTS.md) into the type system.
+      default-signifies-exhaustive: false
     gosec:
       # This tool runs untrusted store bytes through the parser and execs
       # nix-store; subprocess exec (G204), file reads by variable path
